@@ -48,6 +48,9 @@ vrf = "graphql"              # rest | graphql
 url = "https://netbox.lab.example.com"
 token_env = "NETBOX_LAB_TOKEN"
 verify_tls = false           # labs with self-signed certs; never use in prod
+# NetBox behind an internal/enterprise CA? Add that CA instead of switching
+# verification off — this keeps the certificate verified:
+# ca_bundle = "/etc/ssl/internal-ca.pem"
 
 # MCP server defaults for `nbox serve` (optional; absent = stdio, no HTTP).
 # CLI flags (--http, --http-token, --oidc-issuer, …) override these. See docs/MCP.md.

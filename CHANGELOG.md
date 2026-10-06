@@ -28,6 +28,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   move off yanked `chacha20` 0.10.0 and `spin` 0.9.8.
 - Allow `clippy::unused_async_trait_impl` (new in rustc 1.98) on the MCP
   `ServerHandler` impl, whose methods are async by the rmcp trait contract.
+### Added
+
+- **`ca_bundle` trust anchors for NetBox behind an internal CA.**
+  `[profiles.<name>].ca_bundle = "/path/ca.pem"` adds certificates to the
+  bundled Mozilla roots (which contain no private CAs), so an enterprise-issued
+  NetBox certificate verifies instead of failing with `invalid peer certificate:
+  UnknownIssuer`. Previously the only escape hatch was `verify_tls = false`,
+  which disables verification altogether — it would expose the NetBox token to
+  anyone able to intercept the connection. An unreadable bundle, or one
+  containing no certificates, is a startup error rather than a silently
+  unverified connection.
 
 ## [0.14.1] - 2026-07-31
 
