@@ -590,7 +590,20 @@ nbox serve --http 0.0.0.0:8080 \
 ```
 
 This is accountability, not per-user RBAC — the last hop to NetBox still uses the
-single profile token, so scope that token read-only. An audit log
+single profile token, so scope that token read-only. For **real multi-user**
+service, add `--netbox-token-passthrough`: each caller sends their own NetBox API
+token (`X-NetBox-Token`, or `Authorization` when it is otherwise unused) and nbox
+forwards it to NetBox, so NetBox's own permissions and changelog apply to the
+real user — no IdP or credential vault needed. Reads are cached per caller so no
+one sees another user's view, and a request without a token is rejected rather
+than silently downgraded to the server's token:
+
+```bash
+nbox serve --http 0.0.0.0:8080 --netbox-token-passthrough \
+  --allowed-host nbox.example.com
+```
+
+An audit log
 (`nbox::audit`) and an optional per-caller rate limit (`--rate-limit`) round it
 out. Full setup, security model, and IdP notes: [docs/MCP.md](docs/MCP.md).
 

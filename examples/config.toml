@@ -61,3 +61,7 @@ verify_tls = false           # labs with self-signed certs; never use in prod
 # jwks_url      = "https://idp.example.com/keys"  # absent = discover from issuer
 # allowed_hosts = ["nbox.example.com"]         # extra DNS-rebinding allow-list hosts
 # rate_limit    = 120                          # per-caller requests/min (0/absent = off)
+# Multi-user: every caller sends their OWN NetBox API token (X-NetBox-Token, or
+# Authorization when it is otherwise unused) and nbox forwards it to NetBox, so
+# NetBox's permissions and changelog apply to the real user. Requires `http`.
+# netbox_token_passthrough = true

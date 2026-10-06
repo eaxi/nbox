@@ -58,7 +58,17 @@ pub(crate) enum ApplierKind {
 /// principal. The key is internal to the plan store, not exposed as a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WriteActor {
-    Oidc { sub: String },
+    Oidc {
+        sub: String,
+    },
+    /// A NetBox API-token pass-through caller, identified by their token's
+    /// fingerprint. The credential itself *is* the identity here — NetBox
+    /// authenticates and authorizes it, and records the matching user in its own
+    /// change log — so a plan issued to one token can only ever be applied by a
+    /// request carrying that same token.
+    NetBoxToken {
+        fingerprint: String,
+    },
     Local,
 }
 
@@ -66,6 +76,7 @@ impl WriteActor {
     pub(crate) fn key(&self) -> String {
         match self {
             WriteActor::Oidc { sub } => format!("sub:{sub}"),
+            WriteActor::NetBoxToken { fingerprint } => format!("netbox-token:{fingerprint}"),
             WriteActor::Local => "local".to_string(),
         }
     }
@@ -77,7 +88,16 @@ impl WriteActor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteMode {
     Http,
-    Stdio { local_writes: bool },
+    /// HTTP with NetBox API-token pass-through: the caller's own NetBox token
+    /// authorizes the write, so there is no vault and no OIDC scope to check —
+    /// `allow_writes` is the operator's single on/off gate, and NetBox's own
+    /// permissions decide what the caller may actually change.
+    Passthrough {
+        allow_writes: bool,
+    },
+    Stdio {
+        local_writes: bool,
+    },
 }
 
 impl WriteMode {
@@ -326,8 +346,31 @@ impl NboxMcp {
     /// The profile token is used for writes only in explicit stdio local mode.
     fn write_client(
         &self,
+        scope: &super::RequestScope,
         caller: Option<WriteCaller>,
     ) -> Result<(NetBoxClient, WriteActor), ErrorData> {
+        // Pass-through first: when the request carried the caller's own NetBox
+        // token, that token is both the identity and the authorization, and the
+        // scope's client already holds it. No vault lookup, no scope check — the
+        // write lands in NetBox as the caller, and NetBox refuses it if they lack
+        // the permission.
+        if let Some(fingerprint) = scope.caller() {
+            return match self.write_mode {
+                WriteMode::Passthrough { allow_writes: true } => Ok((
+                    scope.client().clone(),
+                    WriteActor::NetBoxToken {
+                        fingerprint: fingerprint.to_string(),
+                    },
+                )),
+                _ => Err(ErrorData::invalid_params(
+                    "MCP writes are not enabled on this nbox serve instance; \
+                     set [serve].allow_writes = true or pass --allow-writes to let \
+                     NetBox API-token pass-through callers write under their own token",
+                    None,
+                )),
+            };
+        }
+
         if let Some(caller) = caller {
             let vault = self.vault.as_ref().ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -380,12 +423,13 @@ impl NboxMcp {
     }
 
     /// Plan a write operation. Builds a `MutationPlan` without mutating.
-    pub(crate) async fn plan_write_impl(
+    pub(crate) async fn plan_write_scoped(
         &self,
+        scope: &super::RequestScope,
         args: PlanWriteArgs,
         caller: Option<WriteCaller>,
     ) -> Result<Json<MutationPlan>, ErrorData> {
-        let (client, actor) = self.write_client(caller)?;
+        let (client, actor) = self.write_client(scope, caller)?;
         let profile = self.profile.as_str();
         let (applier, plan_result) = match args.operation {
             WriteOperation::InterfaceDescription {
@@ -522,12 +566,13 @@ impl NboxMcp {
     /// the submitted `confirm_token` (bound to the same caller) and applies that
     /// stored plan — the caller-supplied plan contents are never trusted, since
     /// the token is a non-secret hash a write-scoped caller could forge.
-    pub(crate) async fn apply_write_impl(
+    pub(crate) async fn apply_write_scoped(
         &self,
+        scope: &super::RequestScope,
         args: ApplyWriteArgs,
         caller: Option<WriteCaller>,
     ) -> Result<Json<MutationReceipt>, ErrorData> {
-        let (client, actor) = self.write_client(caller)?;
+        let (client, actor) = self.write_client(scope, caller)?;
 
         // Apply the plan this server issued for the token — never the caller's
         // contents. A forged/tampered plan has no matching server-stored entry.

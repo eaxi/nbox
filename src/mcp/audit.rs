@@ -40,6 +40,10 @@ pub enum AuthMode {
     StaticBearer,
     /// OIDC resource-server mode — a validated IdP JWT.
     Oidc,
+    /// NetBox API-token pass-through — the caller presented their own NetBox
+    /// token, which nbox forwards to NetBox for that request. Attribution is the
+    /// token's fingerprint, never the token.
+    NetBoxToken,
 }
 
 impl AuthMode {
@@ -49,6 +53,7 @@ impl AuthMode {
             AuthMode::Loopback => "loopback",
             AuthMode::StaticBearer => "static-bearer",
             AuthMode::Oidc => "oidc",
+            AuthMode::NetBoxToken => "netbox-token",
         }
     }
 }
@@ -94,7 +99,27 @@ impl Outcome {
 ///
 /// The IP fallback is prefixed (`ip:`) so an IP-keyed caller can never collide
 /// with a `sub`/`client_id` that happens to look like an address.
+///
+/// See [`caller_key_with_token`] for the pass-through-aware variant — in that
+/// mode the caller's NetBox token fingerprint is the identity.
 pub fn caller_key(identity: Option<&Identity>, peer: Option<IpAddr>) -> String {
+    caller_key_with_token(identity, None, peer)
+}
+
+/// [`caller_key`], plus the NetBox API-token pass-through identity.
+///
+/// Precedence: `sub` → `client_id` → the caller's NetBox token fingerprint →
+/// the peer IP. The token fingerprint slots *below* the OIDC identity (a `sub`
+/// names the human; a fingerprint only names a credential) but *above* the peer
+/// IP, so several pass-through users behind one proxy get their own audit
+/// attribution and their own rate-limit bucket instead of sharing the proxy's
+/// address. The raw token is never part of the key — only its fingerprint (see
+/// [`PassthroughToken::fingerprint`](crate::mcp::passthrough::PassthroughToken::fingerprint)).
+pub fn caller_key_with_token(
+    identity: Option<&Identity>,
+    netbox_token: Option<&crate::mcp::passthrough::PassthroughToken>,
+    peer: Option<IpAddr>,
+) -> String {
     if let Some(id) = identity {
         if let Some(sub) = id.sub.as_deref().filter(|s| !s.is_empty()) {
             return format!("sub:{sub}");
@@ -102,6 +127,9 @@ pub fn caller_key(identity: Option<&Identity>, peer: Option<IpAddr>) -> String {
         if let Some(client) = id.client_id.as_deref().filter(|s| !s.is_empty()) {
             return format!("client:{client}");
         }
+    }
+    if let Some(token) = netbox_token {
+        return token.caller_key();
     }
     match peer {
         Some(ip) => format!("ip:{ip}"),
@@ -161,6 +189,11 @@ pub struct AuditEvent<'a> {
     /// (see [`session_hash`]). Correlatable across a session's requests, but the
     /// raw session token never lands in the log.
     pub session: Option<&'a str>,
+    /// The fingerprint of the caller's pass-through NetBox API token, when the
+    /// server runs in NetBox-token pass-through mode. A stable opaque label —
+    /// never the token itself (see
+    /// [`PassthroughToken::fingerprint`](crate::mcp::passthrough::PassthroughToken::fingerprint)).
+    pub netbox_token_fp: Option<&'a str>,
     /// Response status code.
     pub status: u16,
     /// Coarse outcome.
@@ -188,6 +221,7 @@ impl AuditEvent<'_> {
             method = self.method,
             path = self.path,
             session = self.session,
+            netbox_token_fp = self.netbox_token_fp,
             status = self.status,
             outcome = self.outcome.as_str(),
             latency_ms = self.latency_ms,
@@ -577,6 +611,7 @@ mod tests {
                 method: "POST",
                 path: "/mcp",
                 session: Some("0123456789abcdef"),
+                netbox_token_fp: None,
                 status: 200,
                 outcome: Outcome::Ok,
                 latency_ms: 12,

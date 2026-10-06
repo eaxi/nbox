@@ -28,6 +28,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   move off yanked `chacha20` 0.10.0 and `spin` 0.9.8.
 - Allow `clippy::unused_async_trait_impl` (new in rustc 1.98) on the MCP
   `ServerHandler` impl, whose methods are async by the rmcp trait contract.
+### Added
+
+- **Multi-user NetBox API-token pass-through.** `nbox serve --http
+  --netbox-token-passthrough` (or `[serve].netbox_token_passthrough = true`)
+  makes one nbox process serve many users: each caller presents their own NetBox
+  API token per request — in `X-NetBox-Token`, or in `Authorization` when that
+  header isn't already used by OIDC or `--http-token` — and nbox forwards it
+  verbatim to NetBox. NetBox's object permissions and changelog therefore apply
+  to the real caller, with no IdP and no `[serve.vault]` mapping. Reads are
+  cached per token fingerprint so one user's view is never served to another,
+  `nbox_cache_clear` only drops the caller's own partition, and `--allow-writes`
+  runs writes under the caller's token. A request without a caller token is
+  rejected with `401`, never silently downgraded to the server's profile token.
+  Tokens are redacted everywhere; the audit log records `auth=netbox-token` plus
+  a short SHA-256 `netbox_token_fp` and the per-caller rate-limit bucket keys on
+  it. Pass-through requires the HTTP transport (stdio has no per-request
+  headers, so asking for it there is a usage error) and allows binding a routable
+  address; terminate TLS in front of it.
 
 ## [0.14.1] - 2026-07-31
 

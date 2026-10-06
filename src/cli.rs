@@ -608,6 +608,18 @@ pub enum Command {
         #[arg(long, value_name = "N")]
         rate_limit: Option<u32>,
 
+        /// Serve many users from one instance: require each caller to present
+        /// their own NetBox API token on every HTTP request and forward it
+        /// verbatim to NetBox, instead of using the profile's service token.
+        /// The token rides in `X-NetBox-Token`, or in `Authorization:
+        /// Bearer|Token <token>` when nothing else claims that header. NetBox's
+        /// own object permissions then apply per user, and its change log names
+        /// the real human. Only meaningful with `--http`; it also permits a
+        /// routable bind (terminate TLS in front). Also read from
+        /// `[serve].netbox_token_passthrough`.
+        #[arg(long = "netbox-token-passthrough")]
+        netbox_token_passthrough: bool,
+
         /// Enable MCP write tools (Pattern 2, DESIGN §24). Requires the `http`
         /// feature and `--http` (writes need the HTTP transport so the OIDC
         /// caller identity can be resolved to a per-user NetBox token via the
@@ -1243,6 +1255,7 @@ mod tests {
             "--audience",
             "--oidc-jwks-url",
             "--rate-limit",
+            "--netbox-token-passthrough",
             // global
             "--log-file",
             // search
@@ -1328,6 +1341,7 @@ mod tests {
             r"\-\-audience",
             r"\-\-oidc\-jwks\-url",
             r"\-\-rate\-limit",
+            r"\-\-netbox\-token\-passthrough",
             r"\-\-print\-config",
         ] {
             assert!(serve.contains(flag), "serve man page missing `{flag}`");
@@ -1691,6 +1705,40 @@ mod tests {
                 ..
             }) if value == "edge01"
         ));
+    }
+
+    #[test]
+    fn serve_parses_the_netbox_token_passthrough_flag() {
+        let cli = Cli::try_parse_from([
+            "nbox",
+            "--no-tui",
+            "serve",
+            "--http",
+            "0.0.0.0:8080",
+            "--netbox-token-passthrough",
+        ])
+        .unwrap();
+        let Some(Command::Serve {
+            http,
+            netbox_token_passthrough,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected serve");
+        };
+        assert_eq!(http.as_deref(), Some("0.0.0.0:8080"));
+        assert!(netbox_token_passthrough);
+
+        // Off unless asked for: the default stays single-credential.
+        let plain = Cli::try_parse_from(["nbox", "--no-tui", "serve"]).unwrap();
+        let Some(Command::Serve {
+            netbox_token_passthrough,
+            ..
+        }) = plain.command
+        else {
+            panic!("expected serve");
+        };
+        assert!(!netbox_token_passthrough);
     }
 
     #[test]
