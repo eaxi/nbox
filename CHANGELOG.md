@@ -46,6 +46,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it. Pass-through requires the HTTP transport (stdio has no per-request
   headers, so asking for it there is a usage error) and allows binding a routable
   address; terminate TLS in front of it.
+- **Container image built from source.** A `Dockerfile` (multi-stage; the
+  existing `Dockerfile.release` only wraps prebuilt release binaries) and a
+  `docker-compose.yml` for running the multi-user pass-through server:
+  unprivileged uid 10001, read-only root filesystem, all capabilities dropped,
+  published on loopback for a TLS-terminating proxy to front, and no NetBox
+  credential baked into the image.
 
 ## [0.14.1] - 2026-07-31
 
