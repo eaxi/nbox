@@ -18,13 +18,17 @@ services:
     container_name: nbox-mcp
     restart: unless-stopped
     ports:
-      # Publish on loopback only. Put a TLS-terminating reverse proxy in front
-      # before exposing this: callers send real NetBox credentials on every
-      # request, so plaintext off-host would leak them.
-      - "127.0.0.1:8080:8080"
+      # Defaults to loopback. Callers send real NetBox credentials on every
+      # request, so anything wider should be fronted by a TLS-terminating proxy;
+      # set NBOX_BIND=0.0.0.0 only on a network you trust.
+      - "${NBOX_BIND:-127.0.0.1}:${NBOX_PORT:-8080}:8080"
     configs:
       - source: nbox_config
         target: /etc/nbox/nbox.toml
+    volumes:
+      # Only needed when NetBox is served by an internal CA; point `ca_bundle`
+      # in the config at /etc/nbox/ca.pem. Harmless when unset.
+      - ${NBOX_CA_BUNDLE:-/dev/null}:/etc/nbox/ca.pem:ro
     command:
       - --config
       - /etc/nbox/nbox.toml
