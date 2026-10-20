@@ -431,12 +431,13 @@ impl NboxMcp {
     }
 
     /// Plan a write operation. Builds a `MutationPlan` without mutating.
-    pub(crate) async fn plan_write_scoped(
+    pub(crate) async fn plan_write_impl(
         &self,
-        scope: &super::RequestScope,
         args: PlanWriteArgs,
         caller: Option<WriteCaller>,
+        ext: &rmcp::model::Extensions,
     ) -> Result<Json<MutationPlan>, ErrorData> {
+        let scope = &self.scope_from_extensions(ext)?;
         let (client, actor) = self.write_client(scope, caller)?;
         let profile = self.profile.as_str();
         let (applier, plan_result) = match args.operation {
@@ -574,12 +575,13 @@ impl NboxMcp {
     /// the submitted `confirm_token` (bound to the same caller) and applies that
     /// stored plan — the caller-supplied plan contents are never trusted, since
     /// the token is a non-secret hash a write-scoped caller could forge.
-    pub(crate) async fn apply_write_scoped(
+    pub(crate) async fn apply_write_impl(
         &self,
-        scope: &super::RequestScope,
         args: ApplyWriteArgs,
         caller: Option<WriteCaller>,
+        ext: &rmcp::model::Extensions,
     ) -> Result<Json<MutationReceipt>, ErrorData> {
+        let scope = &self.scope_from_extensions(ext)?;
         let (client, actor) = self.write_client(scope, caller)?;
 
         // Apply the plan this server issued for the token — never the caller's

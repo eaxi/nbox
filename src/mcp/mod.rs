@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResponse, JsonObject, ListPromptsResult,
+    Extensions, GetPromptRequestParams, GetPromptResponse, JsonObject, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
     ResourceTemplate, ServerCapabilities, ServerInfo,
@@ -467,23 +467,14 @@ impl RequestScope {
 }
 
 impl NboxMcp {
-    /// Resolve the [`RequestScope`] for one tool call.
+    /// Resolve the [`RequestScope`] for one tool call from its request
+    /// [`Extensions`].
     ///
     /// Fails closed: with pass-through enabled and no token on the request, this
     /// errors instead of falling back to the shared service token. The HTTP gate
     /// already 401s such a request, so reaching here means the transport changed
     /// underneath us — silently using the service token would turn a multi-user
     /// server back into a single-credential one without anyone noticing.
-    pub(crate) fn scope(
-        &self,
-        ctx: &RequestContext<RoleServer>,
-    ) -> Result<RequestScope, ErrorData> {
-        self.scope_from_extensions(&ctx.extensions)
-    }
-
-    /// The resolution proper, over the rmcp request [`Extensions`] — unit-testable
-    /// without a live `RequestContext`/`Peer`, like
-    /// [`write_caller_from_extensions`].
     pub(crate) fn scope_from_extensions(
         &self,
         ext: &rmcp::model::Extensions,
@@ -763,20 +754,10 @@ impl NboxMcp {
         description = "Show NetBox connection, active backend, versions, and a token-validity preflight (the authenticated user). Use to confirm reachability and a valid token before other lookups.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_status_tool(
-        &self,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<StatusReport>, ErrorData> {
-        self.nbox_status_impl(&self.scope(&ctx)?).await
-    }
-
-    /// `nbox_status` proper, against one request's [`RequestScope`]. In
-    /// pass-through mode the reported `token` preflight is therefore the
-    /// *caller's* NetBox user — the natural "who am I to NetBox?" check.
-    async fn nbox_status_impl(
-        &self,
-        scope: &RequestScope,
-    ) -> Result<Json<StatusReport>, ErrorData> {
+    async fn nbox_status(&self, ext: Extensions) -> Result<Json<StatusReport>, ErrorData> {
+        // In pass-through mode the `token` preflight reports the *caller's*
+        // NetBox user — the natural "who am I to NetBox?" check.
+        let scope = &self.scope_from_extensions(&ext)?;
         let client = scope.client();
         let status = client.status().await.map_err(to_mcp_error)?;
         let api = client.api_routing().await;
@@ -804,19 +785,12 @@ impl NboxMcp {
         output_schema = output_schema(),
         annotations(read_only_hint = true)
     )]
-    async fn nbox_search_tool(
+    async fn nbox_search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
-        self.nbox_search_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_search_impl(
-        &self,
-        scope: &RequestScope,
-        args: SearchArgs,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let fields = args.fields;
         let outcome = Box::pin(scope.client().search(SearchRequest {
             query: args.query,
@@ -864,24 +838,14 @@ impl NboxMcp {
         output_schema = output_schema(),
         annotations(read_only_hint = true)
     )]
-    async fn nbox_get_tool(
+    async fn nbox_get(
         &self,
         Parameters(args): Parameters<GetArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
-        self.nbox_get_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_get_impl(
-        &self,
-        scope: &RequestScope,
-        args: GetArgs,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let fields = args.fields.clone();
-        let Json(value) = self
-            .get_cached_scoped(scope, args)
-            .await
-            .map_err(to_mcp_error)?;
+        let Json(value) = self.get_cached(scope, args).await.map_err(to_mcp_error)?;
         // `fields` projection is applied AFTER the cache (the cache stores the
         // full object keyed by ref/scope only), so two callers asking for
         // different field subsets share one fetch.
@@ -900,26 +864,20 @@ impl NboxMcp {
         description = "Clear nbox's local read cache so the next lookups fetch fresh from NetBox. Use this after data changed in NetBox out-of-band and you need the current state before the cache TTL expires. Safe and read-only with respect to NetBox — it only drops cached copies held in this server process.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
-    async fn nbox_cache_clear_tool(
-        &self,
-        ctx: RequestContext<RoleServer>,
-    ) -> Result<Json<CacheClearReport>, ErrorData> {
-        Ok(self.nbox_cache_clear_impl(&self.scope(&ctx)?))
-    }
-
-    /// Clearing is scoped to the caller in pass-through mode: a multi-user server
-    /// must not let one user drop every other user's cached reads (a trivial
-    /// cross-tenant denial of service). Single-credential modes keep the original
-    /// whole-cache semantics — there is only one user's data in there.
-    fn nbox_cache_clear_impl(&self, scope: &RequestScope) -> Json<CacheClearReport> {
+    async fn nbox_cache_clear(&self, ext: Extensions) -> Result<Json<CacheClearReport>, ErrorData> {
+        // Clearing is scoped to the caller in pass-through mode: a multi-user server
+        // must not let one user drop every other user's cached reads (a trivial
+        // cross-tenant denial of service). Single-credential modes keep the original
+        // whole-cache semantics — there is only one user's data in there.
+        let scope = &self.scope_from_extensions(&ext)?;
         if self.passthrough {
             scope.cache.clear_profile();
         } else {
             self.cache.clear_all();
         }
-        Json(CacheClearReport {
+        Ok(Json(CacheClearReport {
             status: "cache cleared".to_string(),
-        })
+        }))
     }
 
     /// Show one interface on a device, with its addresses and cable-path trace.
@@ -928,19 +886,12 @@ impl NboxMcp {
         description = "Show one interface on a device: its config, assigned IP addresses, and the cable-path trace (what it connects to). Resolve the device by name, slug, or ID.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_get_interface_tool(
+    async fn nbox_get_interface(
         &self,
         Parameters(args): Parameters<InterfaceArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<InterfaceView>, ErrorData> {
-        self.nbox_get_interface_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_get_interface_impl(
-        &self,
-        scope: &RequestScope,
-        args: InterfaceArgs,
-    ) -> Result<Json<InterfaceView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let view = detail::interface_view_by_ref(
             scope.client(),
             &args.device,
@@ -958,19 +909,12 @@ impl NboxMcp {
         description = "Return the next available IP address(es) within a prefix (read-only — nothing is reserved). Pass `count` for several; `vrf` to disambiguate a prefix present in multiple VRFs.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_next_ip_tool(
+    async fn nbox_next_ip(
         &self,
         Parameters(args): Parameters<NextIpArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<AvailableReport>, ErrorData> {
-        self.nbox_next_ip_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_next_ip_impl(
-        &self,
-        scope: &RequestScope,
-        args: NextIpArgs,
-    ) -> Result<Json<AvailableReport>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let count = args.count.unwrap_or(1);
         let p = self
             .resolve_prefix(scope, &args.prefix, args.vrf.as_deref())
@@ -998,19 +942,12 @@ impl NboxMcp {
         description = "Return available (free) child prefixes within a prefix. With `length` (e.g. 26) returns the first free block of that size; without it, lists all free blocks. Pass `vrf` to disambiguate. Read-only — nothing is reserved.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_next_prefix_tool(
+    async fn nbox_next_prefix(
         &self,
         Parameters(args): Parameters<NextPrefixArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<AvailableReport>, ErrorData> {
-        self.nbox_next_prefix_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_next_prefix_impl(
-        &self,
-        scope: &RequestScope,
-        args: NextPrefixArgs,
-    ) -> Result<Json<AvailableReport>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let p = self
             .resolve_prefix(scope, &args.prefix, args.vrf.as_deref())
             .await
@@ -1038,19 +975,12 @@ impl NboxMcp {
         description = "Return recent journal entries (operator notes) for an object, newest first. `kind` and `ref` follow nbox_get; supported kinds are device, ip, prefix, vlan, site, rack, rack_group, circuit, virtual_circuit, aggregate, asn, ip_range, tenant, contact, provider, vm, vm_type, cluster, vrf, route_target, interface (as `<device>/<name>`).",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_journal_tool(
+    async fn nbox_journal(
         &self,
         Parameters(args): Parameters<JournalArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<JournalView>, ErrorData> {
-        self.nbox_journal_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_journal_impl(
-        &self,
-        scope: &RequestScope,
-        args: JournalArgs,
-    ) -> Result<Json<JournalView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let limit = args.limit.unwrap_or(20);
         let (content_type, id) = self
             .resolve_content_type_id(scope, args.kind, &args.reference)
@@ -1070,19 +1000,12 @@ impl NboxMcp {
         description = "Return the change history (system audit log: create/update/delete, who and when) for an object, newest first. Distinct from nbox_journal (operator notes): this is the system-recorded audit trail from /api/core/object-changes/. `kind` and `ref` follow nbox_get; supported kinds are device, ip, prefix, vlan, site, rack, rack_group, circuit, virtual_circuit, aggregate, asn, ip_range, tenant, contact, provider, vm, vm_type, cluster, vrf, route_target, interface (as `<device>/<name>`). Each row includes the top-level fields that changed (pre vs post); pass `diff=true` (pair with a small `limit`, e.g. 1) to include the full before/after JSON payloads per row.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_history_tool(
+    async fn nbox_history(
         &self,
         Parameters(args): Parameters<HistoryArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<HistoryView>, ErrorData> {
-        self.nbox_history_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_history_impl(
-        &self,
-        scope: &RequestScope,
-        args: HistoryArgs,
-    ) -> Result<Json<HistoryView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let limit = args.limit.unwrap_or(20);
         let diff = args.diff.unwrap_or(false);
         let (content_type, id) = self
@@ -1103,19 +1026,12 @@ impl NboxMcp {
         description = "List the tags defined in NetBox (name, slug, color, usage count). Useful for discovering valid `tag` filter values for nbox_search.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_list_tags_tool(
+    async fn nbox_list_tags(
         &self,
         Parameters(args): Parameters<ListTagsArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<TagsView>, ErrorData> {
-        self.nbox_list_tags_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_list_tags_impl(
-        &self,
-        scope: &RequestScope,
-        args: ListTagsArgs,
-    ) -> Result<Json<TagsView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let tags = scope
             .client()
             .tags(args.limit.unwrap_or(200))
@@ -1136,19 +1052,12 @@ impl NboxMcp {
         description = "List objects carrying a tag, across all kinds (NetBox 4.3+). The tag resolves by id, exact name, or exact slug. Returns each object's kind, object_type, id, display, and url, plus the resolved tag. Use this for \"what has tag X\"; use nbox_search with the `tag` filter to narrow a free-text search to tagged hits.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_tagged_tool(
+    async fn nbox_tagged(
         &self,
         Parameters(args): Parameters<TaggedArgs>,
-        ctx: RequestContext<RoleServer>,
+        ext: Extensions,
     ) -> Result<Json<TaggedReport>, ErrorData> {
-        self.nbox_tagged_impl(&self.scope(&ctx)?, args).await
-    }
-
-    async fn nbox_tagged_impl(
-        &self,
-        scope: &RequestScope,
-        args: TaggedArgs,
-    ) -> Result<Json<TaggedReport>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let tag_info = scope
             .client()
             .tag_by_ref(&args.tag)
@@ -1187,8 +1096,7 @@ impl NboxMcp {
         Parameters(args): Parameters<write::PlanWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<crate::netbox::mutation::MutationPlan>, ErrorData> {
-        let scope = self.scope(&ctx)?;
-        self.plan_write_scoped(&scope, args, write_caller(&ctx))
+        self.plan_write_impl(args, write_caller(&ctx), &ctx.extensions)
             .await
     }
 
@@ -1206,8 +1114,7 @@ impl NboxMcp {
         Parameters(args): Parameters<write::ApplyWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<crate::netbox::mutation::MutationReceipt>, ErrorData> {
-        let scope = self.scope(&ctx)?;
-        self.apply_write_scoped(&scope, args, write_caller(&ctx))
+        self.apply_write_impl(args, write_caller(&ctx), &ctx.extensions)
             .await
     }
 }
@@ -1218,7 +1125,7 @@ impl NboxMcp {
     /// agent firing several reads of the same object collapses to one fetch. The
     /// key folds in the disambiguators so the same CIDR in two VRFs caches apart.
     /// A not-found/ambiguous error still propagates (nothing is cached for it).
-    async fn get_cached_scoped(
+    async fn get_cached(
         &self,
         scope: &RequestScope,
         args: GetArgs,
@@ -1348,14 +1255,15 @@ impl NboxMcp {
     /// a single text content. Disambiguators (`vrf`/`site`/`group`) have no
     /// place in a flat URI, so an ambiguous `ref` surfaces its candidate list as
     /// an `invalid_params` error — the caller can then use `nbox_get`.
-    async fn read_resource_scoped(
+    async fn read_resource_impl(
         &self,
-        scope: &RequestScope,
         uri: &str,
+        ext: &Extensions,
     ) -> Result<ReadResourceResult, ErrorData> {
         let (kind, reference) = parse_resource_uri(uri)?;
+        let scope = &self.scope_from_extensions(ext)?;
         let Json(value) = self
-            .get_cached_scoped(
+            .get_cached(
                 scope,
                 GetArgs {
                     kind,
@@ -1501,8 +1409,7 @@ impl ServerHandler for NboxMcp {
         request: ReadResourceRequestParams,
         context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        let scope = self.scope(&context)?;
-        self.read_resource_scoped(&scope, &request.uri)
+        self.read_resource_impl(&request.uri, &context.extensions)
             .await
             .map(Into::into)
     }
@@ -1577,116 +1484,6 @@ pub mod vault;
 pub mod write;
 #[cfg(feature = "http")]
 pub use http::{OidcArgs, ServeOptions, serve_http};
-
-/// Test-only shims binding the *shared* [`RequestScope`] (the server's own
-/// client + cache partition).
-///
-/// Every tool is now a thin wrapper that resolves a per-request scope from the
-/// transport and calls a `*_impl` that takes it explicitly. Unit tests drive a
-/// server with no live HTTP request, so they use these shims to exercise the
-/// single-credential behaviour directly; pass-through behaviour is tested by
-/// building a scope explicitly (see `scope_for_token`). Keeping the shims'
-/// names and signatures identical to the pre-scope API also makes the existing
-/// suite a regression check that threading the scope changed no behaviour.
-#[cfg(test)]
-impl NboxMcp {
-    async fn nbox_status(&self) -> Result<Json<StatusReport>, ErrorData> {
-        self.nbox_status_impl(&self.base_scope()).await
-    }
-
-    async fn nbox_search(
-        &self,
-        Parameters(args): Parameters<SearchArgs>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
-        self.nbox_search_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_get(
-        &self,
-        Parameters(args): Parameters<GetArgs>,
-    ) -> Result<Json<serde_json::Value>, ErrorData> {
-        self.nbox_get_impl(&self.base_scope(), args).await
-    }
-
-    fn nbox_cache_clear(&self) -> Json<CacheClearReport> {
-        self.nbox_cache_clear_impl(&self.base_scope())
-    }
-
-    async fn nbox_get_interface(
-        &self,
-        Parameters(args): Parameters<InterfaceArgs>,
-    ) -> Result<Json<InterfaceView>, ErrorData> {
-        self.nbox_get_interface_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_next_ip(
-        &self,
-        Parameters(args): Parameters<NextIpArgs>,
-    ) -> Result<Json<AvailableReport>, ErrorData> {
-        self.nbox_next_ip_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_next_prefix(
-        &self,
-        Parameters(args): Parameters<NextPrefixArgs>,
-    ) -> Result<Json<AvailableReport>, ErrorData> {
-        self.nbox_next_prefix_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_journal(
-        &self,
-        Parameters(args): Parameters<JournalArgs>,
-    ) -> Result<Json<JournalView>, ErrorData> {
-        self.nbox_journal_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_history(
-        &self,
-        Parameters(args): Parameters<HistoryArgs>,
-    ) -> Result<Json<HistoryView>, ErrorData> {
-        self.nbox_history_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_list_tags(
-        &self,
-        Parameters(args): Parameters<ListTagsArgs>,
-    ) -> Result<Json<TagsView>, ErrorData> {
-        self.nbox_list_tags_impl(&self.base_scope(), args).await
-    }
-
-    async fn nbox_tagged(
-        &self,
-        Parameters(args): Parameters<TaggedArgs>,
-    ) -> Result<Json<TaggedReport>, ErrorData> {
-        self.nbox_tagged_impl(&self.base_scope(), args).await
-    }
-
-    async fn get_cached(&self, args: GetArgs) -> anyhow::Result<Json<serde_json::Value>> {
-        self.get_cached_scoped(&self.base_scope(), args).await
-    }
-
-    async fn read_resource_impl(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
-        self.read_resource_scoped(&self.base_scope(), uri).await
-    }
-
-    async fn plan_write_impl(
-        &self,
-        args: write::PlanWriteArgs,
-        caller: Option<write::WriteCaller>,
-    ) -> Result<Json<crate::netbox::mutation::MutationPlan>, ErrorData> {
-        self.plan_write_scoped(&self.base_scope(), args, caller)
-            .await
-    }
-
-    async fn apply_write_impl(
-        &self,
-        args: write::ApplyWriteArgs,
-        caller: Option<write::WriteCaller>,
-    ) -> Result<Json<crate::netbox::mutation::MutationReceipt>, ErrorData> {
-        self.apply_write_scoped(&self.base_scope(), args, caller)
-            .await
-    }
-}
 
 #[cfg(test)]
 mod tests;
