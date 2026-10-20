@@ -436,19 +436,22 @@ fn project_search_hits(report: SearchReport, fields: &[String]) -> serde_json::V
 /// - **client** — the template client with the caller's token swapped in
 ///   ([`NetBoxClient::with_token`]), so NetBox applies *that user's* object
 ///   permissions and records *their* name in its change log.
-/// - **cache** — a partition keyed by the token's fingerprint. This is not an
+/// - **cache** — a partition keyed by the token's SHA-256 digest. This is not an
 ///   optimization detail but a correctness requirement: NetBox filters read
 ///   results by permission, so a shared partition would let one user's cached
 ///   view of an object be served to another user who may not be allowed to see
 ///   it. Separate partitions make that impossible.
-/// - **caller** — the fingerprint, used as the write actor so a plan issued to
+/// - **caller** — the digest, used as the write actor so a plan issued to
 ///   one token can only be applied by that same token.
 #[derive(Clone)]
 pub(crate) struct RequestScope {
     client: Arc<NetBoxClient>,
     cache: Cache,
-    /// `Some(fingerprint)` in pass-through mode; `None` otherwise.
+    /// `Some(full token digest)` in pass-through mode; `None` otherwise.
     caller: Option<String>,
+    /// `Some(has nbox:write)` when an OIDC identity also authenticated this
+    /// request (pass-through layered on OIDC); `None` otherwise.
+    oidc_write_scope: Option<bool>,
 }
 
 impl RequestScope {
@@ -457,7 +460,7 @@ impl RequestScope {
         &self.client
     }
 
-    /// The caller's NetBox-token fingerprint, when the request carried one.
+    /// The caller's full NetBox-token digest, when the request carried one.
     pub(crate) fn caller(&self) -> Option<&str> {
         self.caller.as_deref()
     }
@@ -481,7 +484,6 @@ impl NboxMcp {
     /// The resolution proper, over the rmcp request [`Extensions`] — unit-testable
     /// without a live `RequestContext`/`Peer`, like
     /// [`write_caller_from_extensions`].
-    #[cfg(feature = "http")]
     pub(crate) fn scope_from_extensions(
         &self,
         ext: &rmcp::model::Extensions,
@@ -489,38 +491,37 @@ impl NboxMcp {
         if !self.passthrough {
             return Ok(self.base_scope());
         }
-        let token = ext
-            .get::<axum::http::request::Parts>()
-            .and_then(|parts| parts.extensions.get::<passthrough::PassthroughToken>())
-            .ok_or_else(|| {
-                ErrorData::invalid_params(
-                    "this nbox server runs in NetBox API-token pass-through mode, but this \
-                     request carried no NetBox API token; send it as `X-NetBox-Token: <token>` \
-                     (or `Authorization: Bearer <token>` when the server has no other auth)",
-                    None,
-                )
-            })?;
-        let fingerprint = token.fingerprint().to_string();
-        Ok(RequestScope {
-            client: Arc::new(self.client.with_token(token.as_str().to_string())),
-            // Per-user partition: see the type docs — cached reads must never
-            // cross a NetBox permission boundary.
-            cache: self.cache.with_partition(format!(
-                "{}|token:{fingerprint}",
-                self.profile_partition_label()
-            )),
-            caller: Some(fingerprint),
-        })
-    }
-
-    /// Non-`http` builds have no pass-through transport, so the scope is always
-    /// the shared one.
-    #[cfg(not(feature = "http"))]
-    pub(crate) fn scope_from_extensions(
-        &self,
-        _ext: &rmcp::model::Extensions,
-    ) -> Result<RequestScope, ErrorData> {
-        Ok(self.base_scope())
+        #[cfg(feature = "http")]
+        if let Some(parts) = ext.get::<axum::http::request::Parts>()
+            && let Some(token) = parts.extensions.get::<passthrough::PassthroughToken>()
+        {
+            let key = token.key().to_string();
+            return Ok(RequestScope {
+                client: Arc::new(self.client.with_token(token.as_str().to_string())),
+                // Per-user partition: see the type docs — cached reads must never
+                // cross a NetBox permission boundary. Keyed on the full digest, not
+                // the short log fingerprint: a cache hit never reaches NetBox, so a
+                // collision would serve another user's data.
+                cache: self
+                    .cache
+                    .with_partition(format!("{}|token:{key}", self.profile_partition_label())),
+                caller: Some(key),
+                // Pass-through layered on OIDC still honors the JWT's scopes for
+                // writes (ADR-0001 §7).
+                oidc_write_scope: parts
+                    .extensions
+                    .get::<oidc::Identity>()
+                    .map(|id| id.has_scope(SCOPE_WRITE)),
+            });
+        }
+        #[cfg(not(feature = "http"))]
+        let _ = ext;
+        Err(ErrorData::invalid_params(
+            "this nbox server runs in NetBox API-token pass-through mode, but this \
+             request carried no NetBox API token; send it as `X-NetBox-Token: <token>` \
+             (or `Authorization: Bearer <token>` when the server has no other auth)",
+            None,
+        ))
     }
 
     /// The shared scope: the server's own client and cache partition. The only
@@ -530,12 +531,14 @@ impl NboxMcp {
             client: self.client.clone(),
             cache: self.cache.clone(),
             caller: None,
+            oidc_write_scope: None,
         }
     }
 
     /// A stable label for this server's connection, prefixed onto the per-token
     /// cache partitions so two profiles pointed at different NetBox instances
     /// can't share a partition even for the same token string.
+    #[cfg(feature = "http")]
     fn profile_partition_label(&self) -> String {
         crate::cache::profile_partition(&self.profile, self.client.base_url().as_str())
     }

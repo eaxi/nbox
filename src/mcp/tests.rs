@@ -4705,225 +4705,343 @@ async fn apply_write_tag_on_prefix_routes_to_tag_applier() {
 // ---------------------------------------------------------------------------
 // NetBox API-token pass-through (multi-user mode)
 // ---------------------------------------------------------------------------
+#[cfg(feature = "http")]
+mod passthrough {
+    use super::*;
 
-/// The multi-user server: the profile supplies the URL only — there is no
-/// service token, because in pass-through mode every tool call is authenticated
-/// by the credential the *caller* presented.
-fn passthrough_server_for(mock: &MockServer, allow_writes: bool) -> NboxMcp {
-    let profile = ProfileConfig {
-        url: mock.uri(),
-        ..Default::default()
-    };
-    NboxMcp::new_passthrough(
-        NetBoxClient::new(&profile, None).unwrap(),
-        crate::cache::Cache::disabled(),
-        "prod".into(),
-        allow_writes,
-    )
-}
-
-/// Build the rmcp request extensions a Streamable-HTTP tool call carries,
-/// optionally with the caller's NetBox token in them — exactly the handoff
-/// `http::gate_inner` performs (it inserts the token into the axum request's
-/// extensions; rmcp then stores the request `Parts` in the tool context).
-fn request_extensions(netbox_token: Option<&str>) -> rmcp::model::Extensions {
-    let mut request = axum::http::Request::builder().uri("/mcp").body(()).unwrap();
-    if let Some(raw) = netbox_token {
-        let token = crate::mcp::passthrough::PassthroughToken::new(raw).expect("a usable token");
-        request.extensions_mut().insert(token);
+    /// The multi-user server: the profile supplies the URL only — there is no
+    /// service token, because in pass-through mode every tool call is authenticated
+    /// by the credential the *caller* presented.
+    fn passthrough_server_for(mock: &MockServer, allow_writes: bool) -> NboxMcp {
+        let profile = ProfileConfig {
+            url: mock.uri(),
+            ..Default::default()
+        };
+        NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::disabled(),
+            "prod".into(),
+            allow_writes,
+        )
     }
-    let (parts, ()) = request.into_parts();
-    let mut ext = rmcp::model::Extensions::new();
-    ext.insert(parts);
-    ext
-}
 
-#[tokio::test]
-async fn passthrough_calls_netbox_with_the_callers_own_token() {
-    let mock = MockServer::start().await;
-    // The mock only answers when the request carries Alice's credential, so a
-    // server that fell back to the (absent) service token cannot pass this.
-    Mock::given(method("GET"))
-        .and(path("/api/dcim/sites/"))
-        .and(header("Authorization", "Token nbt_alice"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-            "count": 1, "next": null, "previous": null,
-            "results": [{
-                "id": 1, "url": "http://nb/api/dcim/sites/1/",
-                "name": "IAD1", "slug": "iad1"
-            }]
-        })))
-        .mount(&mock)
-        .await;
-    mount_empty(&mock, "/api/dcim/racks/").await;
-    mount_empty(&mock, "/api/dcim/devices/").await;
-    mount_empty(&mock, "/api/ipam/prefixes/").await;
-    mount_empty(&mock, "/api/ipam/vlans/").await;
+    /// Build the rmcp request extensions a Streamable-HTTP tool call carries,
+    /// optionally with the caller's NetBox token in them — exactly the handoff
+    /// `http::gate_inner` performs (it inserts the token into the axum request's
+    /// extensions; rmcp then stores the request `Parts` in the tool context).
+    fn request_extensions(netbox_token: Option<&str>) -> rmcp::model::Extensions {
+        request_extensions_with_identity(netbox_token, None)
+    }
 
-    let server = passthrough_server_for(&mock, false);
-    let scope = server
-        .scope_from_extensions(&request_extensions(Some("nbt_alice")))
-        .expect("a scope for Alice's token");
+    /// [`request_extensions`], plus an OIDC identity the gate validated first
+    /// (pass-through layered on `--oidc-issuer`).
+    fn request_extensions_with_identity(
+        netbox_token: Option<&str>,
+        identity: Option<crate::mcp::oidc::Identity>,
+    ) -> rmcp::model::Extensions {
+        let mut request = axum::http::Request::builder().uri("/mcp").body(()).unwrap();
+        if let Some(id) = identity {
+            request.extensions_mut().insert(id);
+        }
+        if let Some(raw) = netbox_token {
+            let token =
+                crate::mcp::passthrough::PassthroughToken::new(raw).expect("a usable token");
+            request.extensions_mut().insert(token);
+        }
+        let (parts, ()) = request.into_parts();
+        let mut ext = rmcp::model::Extensions::new();
+        ext.insert(parts);
+        ext
+    }
 
-    let Json(value) = server
-        .nbox_get_impl(&scope, get_args(GetKind::Site, "iad1"))
-        .await
-        .expect("the site, fetched under the caller's own token");
-    assert_eq!(value["name"], json!("IAD1"));
-}
+    #[tokio::test]
+    async fn passthrough_calls_netbox_with_the_callers_own_token() {
+        let mock = MockServer::start().await;
+        // The mock only answers when the request carries Alice's credential, so a
+        // server that fell back to the (absent) service token cannot pass this.
+        Mock::given(method("GET"))
+            .and(path("/api/dcim/sites/"))
+            .and(header("Authorization", "Token nbt_alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1, "next": null, "previous": null,
+                "results": [{
+                    "id": 1, "url": "http://nb/api/dcim/sites/1/",
+                    "name": "IAD1", "slug": "iad1"
+                }]
+            })))
+            .mount(&mock)
+            .await;
+        mount_empty(&mock, "/api/dcim/racks/").await;
+        mount_empty(&mock, "/api/dcim/devices/").await;
+        mount_empty(&mock, "/api/ipam/prefixes/").await;
+        mount_empty(&mock, "/api/ipam/vlans/").await;
 
-#[tokio::test]
-async fn passthrough_without_a_token_fails_closed() {
-    let mock = MockServer::start().await;
-    let server = passthrough_server_for(&mock, false);
+        let server = passthrough_server_for(&mock, false);
+        let scope = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .expect("a scope for Alice's token");
 
-    let err = server
-        .scope_from_extensions(&request_extensions(None))
-        .err()
-        .expect("a pass-through server must never fall back to the service token");
-    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    assert!(
-        err.message.contains("X-NetBox-Token"),
-        "the error should say where the token belongs: {}",
-        err.message
-    );
-    // And no request was made to NetBox at all.
-    assert!(mock.received_requests().await.unwrap().is_empty());
-}
-
-#[tokio::test]
-async fn passthrough_partitions_the_read_cache_per_caller() {
-    // NetBox filters reads by permission, so one user's cached view must never be
-    // served to another. Point the client at a dead address: the only way a read
-    // can succeed here is a cache hit, which makes the isolation observable.
-    let profile = ProfileConfig {
-        url: "http://127.0.0.1:9/".into(),
-        ..Default::default()
-    };
-    let server = NboxMcp::new_passthrough(
-        NetBoxClient::new(&profile, None).unwrap(),
-        crate::cache::Cache::from_settings(
-            "ignored".into(),
-            &crate::config::CacheSettings {
-                enabled: true,
-                ttl_secs: 30,
-            },
-        ),
-        "prod".into(),
-        false,
-    );
-
-    let alice = server
-        .scope_from_extensions(&request_extensions(Some("nbt_alice")))
-        .unwrap();
-    let bob = server
-        .scope_from_extensions(&request_extensions(Some("nbt_bob")))
-        .unwrap();
-
-    // Seed a value into Alice's partition only.
-    let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
-    alice
-        .cache
-        .put(&key, &json!({ "name": "iad1", "secret_to_alice": true }));
-
-    let args = get_args(GetKind::Site, "iad1");
-    let Json(value) = server
-        .get_cached_scoped(&alice, args.clone())
-        .await
-        .expect("Alice sees her own cached copy");
-    assert_eq!(value["secret_to_alice"], json!(true));
-
-    assert!(
-        server.get_cached_scoped(&bob, args).await.is_err(),
-        "Bob must miss Alice's partition and fall through to NetBox (unreachable here)"
-    );
-}
-
-#[tokio::test]
-async fn passthrough_cache_clear_only_drops_the_callers_partition() {
-    let profile = ProfileConfig {
-        url: "http://127.0.0.1:9/".into(),
-        ..Default::default()
-    };
-    let server = NboxMcp::new_passthrough(
-        NetBoxClient::new(&profile, None).unwrap(),
-        crate::cache::Cache::from_settings(
-            "ignored".into(),
-            &crate::config::CacheSettings {
-                enabled: true,
-                ttl_secs: 30,
-            },
-        ),
-        "prod".into(),
-        false,
-    );
-    let alice = server
-        .scope_from_extensions(&request_extensions(Some("nbt_alice")))
-        .unwrap();
-    let bob = server
-        .scope_from_extensions(&request_extensions(Some("nbt_bob")))
-        .unwrap();
-
-    let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
-    alice.cache.put(&key, &json!({ "owner": "alice" }));
-    bob.cache.put(&key, &json!({ "owner": "bob" }));
-
-    // Bob clears "the cache" — Alice's entries must survive, or any caller could
-    // evict every other caller's reads at will.
-    server.nbox_cache_clear_impl(&bob);
-
-    let Json(value) = server
-        .get_cached_scoped(&alice, get_args(GetKind::Site, "iad1"))
-        .await
-        .expect("Alice's cached copy survived Bob's clear");
-    assert_eq!(value["owner"], json!("alice"));
-    assert!(
-        server
-            .get_cached_scoped(&bob, get_args(GetKind::Site, "iad1"))
+        let Json(value) = server
+            .nbox_get_impl(&scope, get_args(GetKind::Site, "iad1"))
             .await
-            .is_err(),
-        "Bob's own partition was cleared"
-    );
-}
+            .expect("the site, fetched under the caller's own token");
+        assert_eq!(value["name"], json!("IAD1"));
+    }
 
-#[tokio::test]
-async fn passthrough_writes_are_gated_on_allow_writes() {
-    let mock = MockServer::start().await;
-    let server = passthrough_server_for(&mock, false);
-    let scope = server
-        .scope_from_extensions(&request_extensions(Some("nbt_alice")))
-        .unwrap();
+    #[tokio::test]
+    async fn passthrough_without_a_token_fails_closed() {
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, false);
 
-    let args = crate::mcp::write::PlanWriteArgs {
-        operation: crate::mcp::write::WriteOperation::DeviceStatus {
-            device: "edge01".into(),
-            status: "active".into(),
-        },
-    };
-    let err = server
-        .plan_write_scoped(&scope, args, None)
-        .await
-        .err()
-        .expect("writes are off by default, even with a valid caller token");
-    assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
-    assert!(err.message.contains("allow-writes"), "{}", err.message);
-    assert!(
-        mock.received_requests().await.unwrap().is_empty(),
-        "a rejected write must not touch NetBox"
-    );
-}
+        let err = server
+            .scope_from_extensions(&request_extensions(None))
+            .err()
+            .expect("a pass-through server must never fall back to the service token");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("X-NetBox-Token"),
+            "the error should say where the token belongs: {}",
+            err.message
+        );
+        // And no request was made to NetBox at all.
+        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
 
-#[tokio::test]
-async fn a_non_passthrough_server_ignores_a_caller_token() {
-    // Defense in depth: a caller must not be able to switch a single-credential
-    // server into pass-through by sending the header anyway.
-    let mock = MockServer::start().await;
-    let server = server_for(&mock);
-    let scope = server
-        .scope_from_extensions(&request_extensions(Some("nbt_alice")))
-        .expect("the shared scope");
-    assert!(
-        scope.caller().is_none(),
-        "pass-through must be a server-side mode, never something a client can turn on"
-    );
+    #[tokio::test]
+    async fn passthrough_partitions_the_read_cache_per_caller() {
+        // NetBox filters reads by permission, so one user's cached view must never be
+        // served to another. Point the client at a dead address: the only way a read
+        // can succeed here is a cache hit, which makes the isolation observable.
+        let profile = ProfileConfig {
+            url: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        let server = NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::from_settings(
+                "ignored".into(),
+                &crate::config::CacheSettings {
+                    enabled: true,
+                    ttl_secs: 30,
+                },
+            ),
+            "prod".into(),
+            false,
+        );
+
+        let alice = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .unwrap();
+        let bob = server
+            .scope_from_extensions(&request_extensions(Some("nbt_bob")))
+            .unwrap();
+
+        // Seed a value into Alice's partition only.
+        let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
+        alice
+            .cache
+            .put(&key, &json!({ "name": "iad1", "secret_to_alice": true }));
+
+        let args = get_args(GetKind::Site, "iad1");
+        let Json(value) = server
+            .get_cached_scoped(&alice, args.clone())
+            .await
+            .expect("Alice sees her own cached copy");
+        assert_eq!(value["secret_to_alice"], json!(true));
+
+        assert!(
+            server.get_cached_scoped(&bob, args).await.is_err(),
+            "Bob must miss Alice's partition and fall through to NetBox (unreachable here)"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_cache_clear_only_drops_the_callers_partition() {
+        let profile = ProfileConfig {
+            url: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        let server = NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::from_settings(
+                "ignored".into(),
+                &crate::config::CacheSettings {
+                    enabled: true,
+                    ttl_secs: 30,
+                },
+            ),
+            "prod".into(),
+            false,
+        );
+        let alice = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .unwrap();
+        let bob = server
+            .scope_from_extensions(&request_extensions(Some("nbt_bob")))
+            .unwrap();
+
+        let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
+        alice.cache.put(&key, &json!({ "owner": "alice" }));
+        bob.cache.put(&key, &json!({ "owner": "bob" }));
+
+        // Bob clears "the cache" — Alice's entries must survive, or any caller could
+        // evict every other caller's reads at will.
+        server.nbox_cache_clear_impl(&bob);
+
+        let Json(value) = server
+            .get_cached_scoped(&alice, get_args(GetKind::Site, "iad1"))
+            .await
+            .expect("Alice's cached copy survived Bob's clear");
+        assert_eq!(value["owner"], json!("alice"));
+        assert!(
+            server
+                .get_cached_scoped(&bob, get_args(GetKind::Site, "iad1"))
+                .await
+                .is_err(),
+            "Bob's own partition was cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_writes_are_gated_on_allow_writes() {
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, false);
+        let scope = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .unwrap();
+
+        let args = crate::mcp::write::PlanWriteArgs {
+            operation: crate::mcp::write::WriteOperation::DeviceStatus {
+                device: "edge01".into(),
+                status: "active".into(),
+            },
+        };
+        let err = server
+            .plan_write_scoped(&scope, args, None)
+            .await
+            .err()
+            .expect("writes are off by default, even with a valid caller token");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("allow-writes"), "{}", err.message);
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "a rejected write must not touch NetBox"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_passthrough_server_ignores_a_caller_token() {
+        // Defense in depth: a caller must not be able to switch a single-credential
+        // server into pass-through by sending the header anyway.
+        let mock = MockServer::start().await;
+        let server = server_for(&mock);
+        let scope = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .expect("the shared scope");
+        assert!(
+            scope.caller().is_none(),
+            "pass-through must be a server-side mode, never something a client can turn on"
+        );
+    }
+
+    fn device_status_plan_args() -> crate::mcp::write::PlanWriteArgs {
+        crate::mcp::write::PlanWriteArgs {
+            operation: crate::mcp::write::WriteOperation::DeviceStatus {
+                device: "edge01".into(),
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_plan_and_apply_run_under_the_callers_token() {
+        // Every mock requires Alice's token, so a write that fell back to any
+        // other credential would miss.
+        let mock = MockServer::start().await;
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let server = passthrough_server_for(&mock, true);
+        let scope = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice.key")))
+            .unwrap();
+
+        let Json(plan) = server
+            .plan_write_scoped(&scope, device_status_plan_args(), None)
+            .await
+            .expect("plan under the caller's token");
+        let Json(receipt) = server
+            .apply_write_scoped(&scope, crate::mcp::write::ApplyWriteArgs { plan }, None)
+            .await
+            .expect("apply under the caller's token");
+        assert!(receipt.applied);
+        assert_eq!(receipt.status, 200);
+    }
+
+    #[tokio::test]
+    async fn passthrough_plan_from_one_token_cannot_be_applied_with_another() {
+        let mock = MockServer::start().await;
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let server = passthrough_server_for(&mock, true);
+        let alice = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice.key")))
+            .unwrap();
+        let bob = server
+            .scope_from_extensions(&request_extensions(Some("nbt_bob.key")))
+            .unwrap();
+
+        let Json(plan) = server
+            .plan_write_scoped(&alice, device_status_plan_args(), None)
+            .await
+            .expect("Alice's plan");
+        let err = server
+            .apply_write_scoped(&bob, crate::mcp::write::ApplyWriteArgs { plan }, None)
+            .await
+            .err()
+            .expect("Bob must not apply Alice's plan");
+        assert!(
+            err.message.contains("different write actor"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_over_oidc_still_requires_the_write_scope() {
+        // `--oidc-issuer … --netbox-token-passthrough --allow-writes`: a JWT with
+        // only `nbox:read` must not plan writes, whatever NetBox token rides along.
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, true);
+        let identity = |scopes: &[&str]| crate::mcp::oidc::Identity {
+            sub: Some("alice".into()),
+            client_id: None,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: None,
+            iss: None,
+        };
+
+        let read_only = server
+            .scope_from_extensions(&request_extensions_with_identity(
+                Some("nbt_alice.key"),
+                Some(identity(&["nbox:read"])),
+            ))
+            .unwrap();
+        let err = server
+            .plan_write_scoped(&read_only, device_status_plan_args(), None)
+            .await
+            .err()
+            .expect("a read-only JWT must not plan writes");
+        assert!(err.message.contains("nbox:write"), "{}", err.message);
+        assert!(mock.received_requests().await.unwrap().is_empty());
+
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let writer = server
+            .scope_from_extensions(&request_extensions_with_identity(
+                Some("nbt_alice.key"),
+                Some(identity(&["nbox:read", "nbox:write"])),
+            ))
+            .unwrap();
+        server
+            .plan_write_scoped(&writer, device_status_plan_args(), None)
+            .await
+            .expect("a write-scoped JWT plans under the caller's token");
+    }
 }
