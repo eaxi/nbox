@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`ca_bundle` trust anchors for NetBox behind an internal CA.**
+  `[profiles.<name>].ca_bundle = "/path/ca.pem"` adds certificates to the
+  bundled Mozilla roots (which contain no private CAs), so an enterprise-issued
+  NetBox certificate verifies instead of failing with `invalid peer certificate:
+  UnknownIssuer`. Previously the only escape hatch was `verify_tls = false`,
+  which disables verification altogether — it would expose the NetBox token to
+  anyone able to intercept the connection. An unreadable bundle, or one
+  containing no certificates, is a startup error rather than a silently
+  unverified connection.
+
 ### Changed
 
 - Upgrade the MCP SDK `rmcp` 1.8 → 3.3. No change to the tools, resources,
