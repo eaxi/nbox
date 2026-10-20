@@ -32,6 +32,7 @@ url = "https://netbox.example.com"
 token_env = "NETBOX_TOKEN"
 auth_scheme = "auto"          # auto | bearer | token
 verify_tls = true
+# ca_bundle = "/etc/ssl/internal-ca.pem"  # extra trust anchors for a private CA
 timeout_secs = 15
 page_size = 100
 exclude_config_context = true

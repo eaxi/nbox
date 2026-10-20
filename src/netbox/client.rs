@@ -58,7 +58,25 @@ impl NetBoxClient {
             .min(timeout.saturating_sub(Duration::from_secs(1)))
             .max(Duration::from_secs(1));
 
-        let http = reqwest::Client::builder()
+        // Extra trust anchors for a NetBox behind an internal CA. These are
+        // *added* to the bundled Mozilla roots, so the certificate still has to
+        // verify — unlike `verify_tls = false`, which accepts anything and
+        // would expose the NetBox token to an interceptor.
+        let extra_roots = match profile.ca_bundle.as_ref() {
+            Some(path) => {
+                let pem = std::fs::read(path)
+                    .with_context(|| format!("reading ca_bundle {}", path.display()))?;
+                let certs = reqwest::Certificate::from_pem_bundle(&pem)
+                    .with_context(|| format!("parsing ca_bundle {}", path.display()))?;
+                if certs.is_empty() {
+                    anyhow::bail!("ca_bundle {} contains no PEM certificates", path.display());
+                }
+                certs
+            }
+            None => Vec::new(),
+        };
+
+        let mut builder = reqwest::Client::builder()
             .timeout(timeout)
             .connect_timeout(connect_timeout)
             // NetBox is commonly served by gunicorn *sync* workers, which close
@@ -71,9 +89,11 @@ impl NetBoxClient {
             // concurrency is unaffected — the fan-out still opens up to ~17
             // connections at once; they just aren't pooled for the next request.
             .pool_max_idle_per_host(0)
-            .danger_accept_invalid_certs(!verify_tls)
-            .build()
-            .context("building the HTTP client")?;
+            .danger_accept_invalid_certs(!verify_tls);
+        for cert in extra_roots {
+            builder = builder.add_root_certificate(cert);
+        }
+        let http = builder.build().context("building the HTTP client")?;
 
         // Ensure a trailing slash so `Url::join` preserves any base subpath
         // (e.g. NetBox installed under `https://host/netbox/`).
@@ -765,6 +785,56 @@ mod tests {
         let masked = c.masked_authorization().unwrap();
         assert_eq!(masked, "Token ****");
         assert!(!masked.contains("legacysecret"));
+    }
+
+    /// A throwaway self-signed certificate, only ever parsed — never used to
+    /// verify a connection — so it cannot expire out from under the tests.
+    const TEST_CA_PEM: &str = "-----BEGIN CERTIFICATE-----\nMIIDETCCAfmgAwIBAgIUBE4mRGKrVup93vp3JL1+HlkVProwDQYJKoZIhvcNAQEL\nBQAwFzEVMBMGA1UEAwwMbmJveC10ZXN0LWNhMCAXDTI2MDkxNTEyNDI1MFoYDzIx\nMjYwODIyMTI0MjUwWjAXMRUwEwYDVQQDDAxuYm94LXRlc3QtY2EwggEiMA0GCSqG\nSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDgj6cfzkd1zLJVaUvl44vCI41lkiSXClGF\nijOlqVsJmKfZ7miGpy8+XtBKSFYT/HwH5eSNGx1DUyGfz7kJuW8V2szOIpmjtm1r\n0gb9tz5tauFiZy7YhC+DhW/TTBCfa/gMYl04KY7JAP7SbD2TKpXe9BR2uTRNvQsD\nOMOqmuYF4kKZ5tasi8psnyoZKNB0z3YpxXexm7jTczLAgt01gmi9As5kztehifcP\nZ3ULvwi4cUdqPrh5XMgxoyArHXqibvvjY5XxA8+8D47pyT6US15rUlG+J/tdA7xy\nyryu/vogM40xIcZGLllThHa0tQj6mB6T3CEx9Hvfr7AyIWmLWBJxAgMBAAGjUzBR\nMB0GA1UdDgQWBBQNrAfegK3vwZlptf4x1TaCMfRvQDAfBgNVHSMEGDAWgBQNrAfe\ngK3vwZlptf4x1TaCMfRvQDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3DQEBCwUA\nA4IBAQDUMjeeSNL4LJRgkALKXky0d9rW3bkr5O8f9PBTJxUCjFAaArfB1npoWrCO\nq6mSJiz8qgb/7SOUvSKGbP4pfImXwxrhFYW8cx6YhSdkumGAUR3bOPZX7Z3pgF9j\nfjSIPaCb2PPAnTqrWaWVYdYL6TlQp+mUELijELjj7XcZJvZjgbR+RJUaWU7tLCoT\nmxxKPeSzhZnMpunAhd6gDtUJN2OETymjQgLSQOEqkglmXJfqF3QHOjxm2HQh3+XL\nP2vBMn4XFT4ZnmWkByUzb3jkvfvqudpeL52fb0u2f5pqYPqSLdodAFG4V6VElMtS\nNb59Pncu5uWcg6EI/8hTQil7hzCl\n-----END CERTIFICATE-----";
+
+    fn profile_with_ca(path: &std::path::Path) -> ProfileConfig {
+        ProfileConfig {
+            url: "https://netbox.internal".into(),
+            ca_bundle: Some(path.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn ca_bundle_adds_trust_anchors() {
+        // An internal CA is added to the bundled roots; verification stays on.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, TEST_CA_PEM).unwrap();
+        assert!(NetBoxClient::new(&profile_with_ca(&path), None).is_ok());
+    }
+
+    #[test]
+    fn ca_bundle_that_cannot_be_read_is_a_clear_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.pem");
+        let err = NetBoxClient::new(&profile_with_ca(&missing), None)
+            .err()
+            .expect("a ca_bundle path that isn't there must not be ignored");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("ca_bundle"), "{msg}");
+        assert!(msg.contains("nope.pem"), "{msg}");
+    }
+
+    #[test]
+    fn ca_bundle_without_certificates_is_rejected() {
+        // Fail loudly rather than build a client with no extra roots: the
+        // alternative is a confusing `UnknownIssuer` at the first request, far
+        // from the typo that caused it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.pem");
+        std::fs::write(&path, "# no certificates here\n").unwrap();
+        let err = NetBoxClient::new(&profile_with_ca(&path), None)
+            .err()
+            .expect("an empty ca_bundle is a configuration mistake");
+        assert!(
+            format!("{err:#}").contains("no PEM certificates"),
+            "{err:#}"
+        );
     }
 
     #[test]

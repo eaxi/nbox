@@ -277,6 +277,16 @@ pub struct ProfileConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verify_tls: Option<bool>,
 
+    /// Path to a PEM file of extra trust anchors, for a NetBox served by an
+    /// internal/enterprise CA. nbox ships the Mozilla root store, which does not
+    /// include private CAs; this *adds* to it rather than replacing it.
+    ///
+    /// Prefer this over `verify_tls = false`: it keeps the certificate actually
+    /// verified. Turning verification off accepts any certificate at all, which
+    /// would expose the NetBox token to anyone able to intercept the connection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_bundle: Option<PathBuf>,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_secs: Option<u64>,
 
