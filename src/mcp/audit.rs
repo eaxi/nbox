@@ -249,6 +249,9 @@ pub struct RateLimiter {
     state: Mutex<HashMap<String, Window>>,
 }
 
+/// Map size at which [`RateLimiter`] starts dropping elapsed windows.
+const PRUNE_THRESHOLD: usize = 1024;
+
 /// One caller's current window: when it opened and how many requests it has seen.
 struct Window {
     /// When this window started.
@@ -298,6 +301,12 @@ impl RateLimiter {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Caller keys can come from unauthenticated input (a pass-through token
+        // fingerprint), so drop elapsed windows once the map grows.
+        // ponytail: O(n) scan per check above the threshold; fine at this size.
+        if state.len() >= PRUNE_THRESHOLD {
+            state.retain(|_, w| now.duration_since(w.started) < self.window);
+        }
         let entry = state.entry(caller.to_string()).or_insert(Window {
             started: now,
             count: 0,
@@ -476,6 +485,18 @@ mod tests {
         // A minute later the window has reset → allowed again.
         let later = t0 + Duration::from_secs(61);
         assert_eq!(rl.check_at("sub:a", later), RateDecision::Allow);
+    }
+
+    #[test]
+    fn limiter_prunes_expired_windows() {
+        let rl = RateLimiter::new(1).unwrap();
+        let t0 = Instant::now();
+        for i in 0..PRUNE_THRESHOLD {
+            assert_eq!(rl.check_at(&format!("ip:{i}"), t0), RateDecision::Allow);
+        }
+        let later = t0 + Duration::from_secs(61);
+        assert_eq!(rl.check_at("ip:new", later), RateDecision::Allow);
+        assert_eq!(rl.state.lock().unwrap().len(), 1);
     }
 
     #[test]

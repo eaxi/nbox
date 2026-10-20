@@ -344,7 +344,9 @@ So a host that can only set a bearer works out of the box, and a host that needs
 }
 ```
 
-A request with no caller token is rejected with `401` before any MCP handling.
+A request with no caller token is rejected before any MCP handling: `401` when
+nothing else authenticated it, `403` (no challenge) when OIDC or `--http-token`
+already did.
 nbox **never** falls back to its own profile token for such a request — a
 misconfigured client gets an error, not somebody else's privileges.
 
@@ -360,8 +362,8 @@ misconfigured client gets an error, not somebody else's privileges.
 - **Writes** are still opt-in with `--allow-writes` (or `[serve].allow_writes =
   true`). When enabled they run under the caller's token, which means NetBox's
   object permissions gate them and its changelog attributes them to the real
-  user. The `nbox_plan_write` → `nbox_apply_write` confirm-token lifecycle is
-  unchanged.
+  user. Behind OIDC the JWT still needs `nbox:write`. The `nbox_plan_write` →
+  `nbox_apply_write` confirm-token lifecycle is unchanged.
 - **The audit log** records a short, non-reversible fingerprint of the token
   (`netbox_token_fp`, a SHA-256 prefix) and `auth=netbox-token`. Tokens are never
   logged, printed, or included in error messages.
@@ -380,10 +382,13 @@ NBOX_PUBLIC_HOST=nbox.example.com docker compose up -d --build
 ```
 
 The container runs unprivileged (uid 10001), read-only, with all capabilities
-dropped, and publishes `127.0.0.1:8080` — put your TLS-terminating reverse proxy
-in front of that and set `NBOX_PUBLIC_HOST` to the name it serves so the
-`Host`/`Origin` check matches. No NetBox credential is baked into the image or
-the config: the container is only useful once callers bring their own tokens.
+dropped, and publishes `127.0.0.1:8080` (override with `NBOX_BIND` /
+`NBOX_PORT`) — put your TLS-terminating reverse proxy in front of that and set
+`NBOX_PUBLIC_HOST` to the name it serves so the `Host`/`Origin` check matches. For
+a NetBox behind an internal CA, set `NBOX_CA_BUNDLE` to the PEM file; it is
+mounted at `/etc/nbox/ca.pem`, so set `ca_bundle = "/etc/nbox/ca.pem"` in the
+profile. No NetBox credential is baked into the image or the config: the
+container is only useful once callers bring their own tokens.
 
 ```bash
 # Smoke test: no token must be refused, never served from a shared identity.
@@ -406,7 +411,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST http://127.0.0.1:8080/mcp \
   address is allowed in this mode without the loopback restriction the
   single-credential modes apply.
 - **Rate limiting** (below) keys its per-caller bucket on the token fingerprint,
-  so one user cannot spend another user's budget. The coarse pre-auth bucket is
+  so one user cannot spend another user's budget (a client rotating tokens
+  gets a fresh bucket per token). The coarse pre-auth bucket is
   still per peer IP — behind a reverse proxy every caller shares that peer, so
   size `--rate-limit` for the whole fleet or have the proxy do per-user limiting.
 

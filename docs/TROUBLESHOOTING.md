@@ -122,11 +122,27 @@ full schema.
 
 ## TLS
 
-### Certificate error against a lab instance
+### Certificate error (`invalid peer certificate: UnknownIssuer`)
 
-A self-signed or otherwise untrusted certificate fails verification. For a lab
-you control, disable verification on that profile only — never in production,
-where it removes the protection TLS provides:
+nbox ships the Mozilla root store, which does not contain private CAs. If your
+NetBox is served by an internal/enterprise CA, add that CA's certificate rather
+than switching verification off — the certificate stays verified:
+
+```toml
+[profiles.work]
+ca_bundle = "/etc/ssl/internal-ca.pem"   # PEM; may hold the whole chain
+```
+
+You can usually fetch the CA from the `CA Issuers` URL in the server
+certificate:
+
+```bash
+openssl s_client -connect netbox.example.com:443 -servername netbox.example.com \
+  </dev/null 2>/dev/null | openssl x509 -noout -text | grep -A2 "Authority Information Access"
+```
+
+For a lab you control, `verify_tls = false` disables verification entirely —
+never in production, where an interceptor could steal the NetBox token:
 
 ```toml
 [profiles.lab]

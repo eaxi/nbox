@@ -169,12 +169,15 @@ path also has an ops layer: a structured audit log (one `tracing` event per
 authenticated request under the target `nbox::audit` — WHO/WHAT/WHEN/OUTCOME, no
 token ever; off under the default `warn` filter, opt in with
 `NBOX_LOG=…,nbox::audit=info`) and an opt-in per-caller rate limit
-(`--rate-limit <N>` / `[serve].rate_limit`, keyed `sub`→`client_id`→peer IP, over
+(`--rate-limit <N>` / `[serve].rate_limit`, keyed `sub`→`client_id`→NetBox-token fingerprint→peer IP, over
 the limit → `429`+`Retry-After`; `0`/absent = off). Run without `--allow-writes`
 this is **read-only Pattern 3**: the last hop to NetBox uses the one local profile
 token, so the audit log is accountability, not per-user RBAC — trusted single-team
 read-only. Adding `--allow-writes` layers on the shipped Pattern 2 write vault
-(per-user NetBox identity bridging via `[serve.vault]`). A raw escape-hatch MCP
+(per-user NetBox identity bridging via `[serve.vault]`). `--netbox-token-passthrough`
+instead forwards each caller's own NetBox token (`X-NetBox-Token`, or
+`Authorization` when no other auth uses it), so NetBox permissions apply per
+user; no token → `401`/`403`, never the profile token. A raw escape-hatch MCP
 tool and full per-prompt argument schemas are later. See `docs/MCP.md`.
 
 ## Configuration

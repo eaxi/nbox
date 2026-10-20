@@ -22,8 +22,9 @@
 //!
 //! The raw token never leaves this module in printable form: [`PassthroughToken`]
 //! has a hand-written `Debug` that renders `<redacted>`, and every log/audit/
-//! rate-limit/cache-partition use goes through the non-reversible
-//! [`fingerprint`](PassthroughToken::fingerprint) instead.
+//! rate-limit use goes through the non-reversible short
+//! [`fingerprint`](PassthroughToken::fingerprint), and the cache partition and
+//! plan store use the full digest ([`key`](PassthroughToken::key)).
 
 use std::fmt;
 use std::sync::Arc;
@@ -85,7 +86,8 @@ impl Placement {
 #[derive(Clone)]
 pub struct PassthroughToken {
     token: Arc<str>,
-    fingerprint: Arc<str>,
+    /// Hex SHA-256 of the token (64 chars).
+    digest: Arc<str>,
 }
 
 impl fmt::Debug for PassthroughToken {
@@ -93,7 +95,7 @@ impl fmt::Debug for PassthroughToken {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("PassthroughToken")
             .field("token", &"<redacted>")
-            .field("fingerprint", &self.fingerprint)
+            .field("fingerprint", &self.fingerprint())
             .finish()
     }
 }
@@ -107,10 +109,10 @@ impl PassthroughToken {
     /// `Authorization` value into `X-NetBox-Token` still works.
     pub fn new(raw: &str) -> Option<Self> {
         let token = crate::config::normalize_token(raw)?;
-        let fingerprint = fingerprint(&token);
+        let digest = digest_hex(&token);
         Some(Self {
             token: Arc::from(token.as_str()),
-            fingerprint: Arc::from(fingerprint.as_str()),
+            digest: Arc::from(digest.as_str()),
         })
     }
 
@@ -121,33 +123,36 @@ impl PassthroughToken {
         &self.token
     }
 
-    /// A stable, non-reversible 16-hex-char label for this token.
-    ///
-    /// The same token always fingerprints to the same value, so it works as an
-    /// audit caller key, a rate-limit bucket, and a cache partition — while
-    /// being useless to an attacker who reads the log. (A SHA-256 prefix:
-    /// truncation weakens only preimage resistance, which is irrelevant for an
-    /// opaque label.)
+    /// A stable, non-reversible 16-hex-char label for this token: the first 8
+    /// bytes of its SHA-256. For logs, audit, and the rate-limit bucket only —
+    /// 64 bits is fine for a display label but not for isolation; see
+    /// [`key`](Self::key).
     pub fn fingerprint(&self) -> &str {
-        &self.fingerprint
+        &self.digest[..16]
+    }
+
+    /// The full hex SHA-256 of the token. Keys the read-cache partition and the
+    /// write plan store, where a collision would hand one caller another's
+    /// cached data or plans.
+    pub fn key(&self) -> &str {
+        &self.digest
     }
 
     /// The audit / rate-limit caller key. Prefixed so it can never collide with
     /// a `sub:` / `client:` / `ip:` key from [`crate::mcp::audit::caller_key`].
     pub fn caller_key(&self) -> String {
-        format!("netbox-token:{}", self.fingerprint)
+        format!("netbox-token:{}", self.fingerprint())
     }
 }
 
-/// SHA-256 the token and render the first 8 bytes as hex. Mirrors
-/// [`crate::mcp::audit::session_hash`]'s shape so log fields look consistent.
-fn fingerprint(token: &str) -> String {
+/// SHA-256 the token and render it as hex.
+fn digest_hex(token: &str) -> String {
     use std::fmt::Write as _;
 
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(token.as_bytes());
-    let mut out = String::with_capacity(16);
-    for byte in &digest[..8] {
+    let mut out = String::with_capacity(64);
+    for byte in &digest {
         let _ = write!(out, "{byte:02x}");
     }
     out
@@ -253,6 +258,9 @@ mod tests {
         assert_eq!(alice.fingerprint(), alice2.fingerprint());
         assert_ne!(alice.fingerprint(), bob.fingerprint());
         assert_eq!(alice.fingerprint().len(), 16);
+        assert_eq!(alice.key().len(), 64);
+        assert!(alice.key().starts_with(alice.fingerprint()));
+        assert_ne!(alice.key(), bob.key());
         assert!(!alice.fingerprint().contains("nbt_alice"));
         assert_eq!(
             alice.caller_key(),
