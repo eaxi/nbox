@@ -221,7 +221,7 @@ file with `--config <path>`.
 The optional `[serve]` table holds defaults for `nbox serve` (the MCP server).
 Absent ⇒ stdio (no HTTP). For single-value settings, CLI flags override config.
 `allowed_hosts` is additive, and boolean gates (`allow_writes`,
-`local_writes`) are enabled if either the flag or config key is true.
+`local_writes`, `netbox_token_passthrough`) are enabled if either the flag or config key is true.
 
 | Key | Effect | Flag |
 |-----|--------|------|
@@ -232,6 +232,7 @@ Absent ⇒ stdio (no HTTP). For single-value settings, CLI flags override config
 | `jwks_url` | JWKS URL override; absent ⇒ discover from the issuer. | `--oidc-jwks-url` |
 | `allowed_hosts` | Extra hostnames for the DNS-rebinding allow-list (OIDC/routable mode only), on top of the audience host + loopback. | `--allowed-host` |
 | `rate_limit` | Per-caller request cap on `/mcp`, in requests per minute. Absent / `0` ⇒ disabled. | `--rate-limit` |
+| `netbox_token_passthrough` | Multi-user HTTP: each caller sends their own NetBox API token per request (`X-NetBox-Token`, or `Authorization` when no other auth uses it) and nbox forwards it instead of the profile token. HTTP only; allows a routable bind. | `--netbox-token-passthrough` |
 | `local_writes` | Enable local single-user MCP writes over stdio using the active profile token. Separate from `allow_writes`; rejected with HTTP in this release. | `--local-writes` |
 | `allow_writes` | Enable shared HTTP/OIDC MCP writes when paired with `[serve.vault]` and callers carrying `nbox:write`. Does not imply `local_writes`. | `--allow-writes` |
 
@@ -246,6 +247,8 @@ http = "127.0.0.1:8080"
 # jwks_url      = "https://idp.example.com/keys"
 # allowed_hosts = ["nbox.example.com"]
 # rate_limit    = 120
+# multi-user: forward each caller's own NetBox token:
+# netbox_token_passthrough = true
 # local stdio writes:
 # local_writes = true
 # shared HTTP/OIDC writes:

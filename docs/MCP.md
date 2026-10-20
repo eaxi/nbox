@@ -344,7 +344,9 @@ So a host that can only set a bearer works out of the box, and a host that needs
 }
 ```
 
-A request with no caller token is rejected with `401` before any MCP handling.
+A request with no caller token is rejected before any MCP handling: `401` when
+nothing else authenticated it, `403` (no challenge) when OIDC or `--http-token`
+already did.
 nbox **never** falls back to its own profile token for such a request — a
 misconfigured client gets an error, not somebody else's privileges.
 
@@ -360,8 +362,8 @@ misconfigured client gets an error, not somebody else's privileges.
 - **Writes** are still opt-in with `--allow-writes` (or `[serve].allow_writes =
   true`). When enabled they run under the caller's token, which means NetBox's
   object permissions gate them and its changelog attributes them to the real
-  user. The `nbox_plan_write` → `nbox_apply_write` confirm-token lifecycle is
-  unchanged.
+  user. Behind OIDC the JWT still needs `nbox:write`. The `nbox_plan_write` →
+  `nbox_apply_write` confirm-token lifecycle is unchanged.
 - **The audit log** records a short, non-reversible fingerprint of the token
   (`netbox_token_fp`, a SHA-256 prefix) and `auth=netbox-token`. Tokens are never
   logged, printed, or included in error messages.
@@ -381,7 +383,8 @@ misconfigured client gets an error, not somebody else's privileges.
   address is allowed in this mode without the loopback restriction the
   single-credential modes apply.
 - **Rate limiting** (below) keys its per-caller bucket on the token fingerprint,
-  so one user cannot spend another user's budget. The coarse pre-auth bucket is
+  so one user cannot spend another user's budget (a client rotating tokens
+  gets a fresh bucket per token). The coarse pre-auth bucket is
   still per peer IP — behind a reverse proxy every caller shares that peer, so
   size `--rate-limit` for the whole fleet or have the proxy do per-user limiting.
 

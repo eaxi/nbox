@@ -30,8 +30,8 @@ because it changes what credential reaches NetBox.
 
 ## Decision
 
-Add an opt-in multi-user mode, **NetBox API-token pass-through** (Pattern 4 in
-the code, continuing the DESIGN §24 numbering), enabled by
+Add an opt-in multi-user mode, **NetBox API-token pass-through** (Pattern 4,
+after the Pattern 2/3 modes in `docs/MCP.md`), enabled by
 `--netbox-token-passthrough` or `[serve].netbox_token_passthrough`:
 
 1. **The caller's NetBox token is the credential.** Each request carries the
@@ -41,19 +41,23 @@ the code, continuing the DESIGN §24 numbering), enabled by
    nbox forwards it verbatim; NetBox's object permissions, constraints, and
    change log apply to the real caller. No IdP, no vault.
 2. **Fail closed.** A request without a caller token is rejected with `401`
-   and a body naming the expected header. There is no fallback to the profile
+   (or `403` without a challenge when OIDC or `--http-token` already
+   authenticated the caller) and a body naming the expected header. There is no fallback to the profile
    token — a misconfigured client gets an error, not someone else's rights.
 3. **Per-token isolation is a correctness requirement, not an optimization.**
    NetBox filters read results by permission, so the same query returns
    different rows to different users: the read cache is partitioned per
-   token fingerprint (first 8 bytes of SHA-256, hex), and `nbox_cache_clear`
+   token (full SHA-256, hex — a cache hit never reaches NetBox, so a
+   truncated key's collision would serve another user's data), and
+   `nbox_cache_clear`
    drops only the caller's own partition (no cross-tenant cache flush).
 4. **Writes run under the caller's token, opt-in as before.** With
    `--allow-writes`, the plan/apply two-step and audit of ADR-0001 run
    unchanged, but the `PATCH`/`POST` to NetBox carries the caller's token
    (`WriteMode::Passthrough`); the plan store binds plans to
-   `netbox-token:<fingerprint>`. A configured `[serve.vault]` is ignored in
-   this mode, with a startup warning.
+   `netbox-token:<sha256>`. Behind OIDC the JWT still needs `nbox:write`. A
+   configured `[serve.vault]` is ignored in this mode, with a startup
+   warning.
 5. **HTTP transport only.** stdio has no per-request headers; requesting
    pass-through there is a usage error (exit 2), not a silent no-op.
 6. **A routable bind is allowed**, because a shared server is the point —
@@ -62,8 +66,9 @@ the code, continuing the DESIGN §24 numbering), enabled by
    it.
 7. **Attribution without exposure.** The token never appears in logs or
    errors (hand-written `Debug` renders `<redacted>`); the audit log records
-   `auth=netbox-token` plus the fingerprint, which also keys the post-auth
-   rate-limit bucket, so changing IP does not dodge the limit.
+   `auth=netbox-token` plus a 16-hex fingerprint (SHA-256 prefix), which
+   also keys the post-auth rate-limit bucket, so changing IP does not dodge
+   the limit.
 
 Implementation follows the existing `RequestContext::extensions` handoff that
 `write_caller_from_extensions()` already uses for the OIDC `Identity`: the HTTP
@@ -94,12 +99,17 @@ Negative / trade-offs (accepted):
   behavior shared with OIDC mode; fixing it needs a transport-level limit
   (or proxy-side), not an nbox-side one, and is documented rather than
   silently inherited.
+- **Rotating tokens is not throttled per caller.** The post-auth bucket keys
+  on the token, so a client cycling through tokens (valid or not) gets a fresh
+  bucket each time; only the pre-auth per-IP bucket applies. Expired buckets
+  are pruned, so this cannot grow memory without bound.
 - **nbox sees every caller token in memory** for the duration of a request.
   Mitigations: never logged, never echoed, `Debug` redacted, per-fingerprint
   audit only. Residual risk equals any API gateway fronting NetBox.
-- **Token lifecycle is NetBox's.** A revoked or expired token fails at
-  request time; nbox has no way to pre-validate beyond forwarding, and does
-  not try.
+- **Token lifecycle is NetBox's.** A revoked or expired token fails on its
+  next request that reaches NetBox; reads still in that token's cache
+  partition keep being served until the cache TTL expires. nbox has no way to
+  pre-validate beyond forwarding, and does not try.
 - The `Authorization`-fallback placement is a heuristic (bearer-shaped
   strings that are not OIDC/static-bearer are treated as NetBox tokens). With
   OIDC or `--http-token` active it is disabled entirely, so the ambiguity it
@@ -107,11 +117,10 @@ Negative / trade-offs (accepted):
 
 Neutral:
 
-- Cache partitions per fingerprint mean one user evicting hot entries cannot
-  poison another's view; the cache was already per-profile-partitioned, so
-  the additional keying is a small step.
-- "Pattern 4" continues the DESIGN §24 numbering; that document is not part
-  of the public repository, so the label is descriptive, not contractual.
+- Per-token cache partitions mean one user can never read or poison
+  another's entries. The store still has one global entry cap with
+  oldest-first eviction, so a busy user can evict other users' entries
+  (costing them a refetch, never wrong data).
 
 ## References
 
