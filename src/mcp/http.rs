@@ -811,8 +811,8 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
     //     This is what makes the server multi-user — the token is forwarded
     //     verbatim on the last hop, so NetBox's object permissions (and its
     //     change log) apply per user instead of per service account. It is an
-    //     auth factor in its own right: no token ⇒ 401 here, before any NetBox
-    //     call and before the request can reach a tool.
+    //     auth factor in its own right: no token ⇒ rejected here, before any
+    //     NetBox call and before the request can reach a tool.
     //
     //     When pass-through is off this is `None` and nothing downstream
     //     changes — the profile's service token still does the last hop.
@@ -824,7 +824,13 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
                     auth_mode: AuthMode::NetBoxToken,
                     identity,
                     netbox_token: None,
-                    response: missing_netbox_token(placement),
+                    // Already authenticated by OIDC / the static bearer ⇒ 403
+                    // without a challenge, so an OAuth client doesn't read it
+                    // as a rejected JWT and loop re-auth.
+                    response: missing_netbox_token(
+                        placement,
+                        !matches!(auth_mode, AuthMode::Loopback),
+                    ),
                 };
             }
         },
@@ -1085,14 +1091,23 @@ fn loopback_unauthorized() -> Response {
     response
 }
 
-/// 401 for a pass-through request that carried no usable NetBox API token.
+/// Rejection for a pass-through request that carried no usable NetBox API token.
 ///
 /// The body names the accepted headers for the deployment's [`Placement`], so a
-/// client that put the token in the wrong place is told where it belongs. The
-/// challenge is `Bearer` with `invalid_request` (RFC 6750) — the credential is
-/// missing, not rejected by NetBox; a token NetBox itself refuses surfaces as
-/// the tool's own 401/403 error instead.
-fn missing_netbox_token(placement: Placement) -> Response {
+/// client that put the token in the wrong place is told where it belongs.
+/// Unauthenticated: `401` with a `Bearer` `invalid_request` challenge (RFC
+/// 6750). `authenticated` (OIDC or the static bearer already passed): `403`
+/// with no challenge — the caller's own auth is fine, only the NetBox token is
+/// missing. A token NetBox itself refuses surfaces as the tool's own error.
+fn missing_netbox_token(placement: Placement, authenticated: bool) -> Response {
+    if authenticated {
+        let mut response = Response::new(Body::from(format!(
+            "Forbidden: this nbox server runs in NetBox API-token pass-through mode — {}",
+            placement.hint()
+        )));
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
     let mut response = Response::new(Body::from(format!(
         "Unauthorized: this nbox server runs in NetBox API-token pass-through mode — {}",
         placement.hint()
@@ -2934,15 +2949,19 @@ mod rs_tests {
             AllowedHosts::default(),
             Some(Placement::DedicatedHeaderOnly),
         );
-        let (status, _www, body) = send(
+        let (status, www, body) = send(
             router.clone(),
             mcp_request_with(&[("authorization", "Bearer s3cret")]),
         )
         .await;
         assert_eq!(
             status,
-            StatusCode::UNAUTHORIZED,
+            StatusCode::FORBIDDEN,
             "the static bearer alone is not a NetBox token: {body}"
+        );
+        assert!(
+            www.is_none(),
+            "an authenticated caller must not get a Bearer challenge"
         );
 
         let (status, _www, body) = send(
