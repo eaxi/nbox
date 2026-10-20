@@ -10,6 +10,7 @@ contributors understand why the design exists, not just what changed.
 |-----|-------|--------|------|
 | [0001](0001-safe-write-foundation.md) | Safe write foundation | Accepted | 2026-06-26 |
 | [0002](0002-local-single-user-mcp-writes.md) | Local single-user MCP writes | Accepted | 2026-06-29 |
+| [0003](0003-netbox-token-passthrough.md) | NetBox API-token pass-through | Proposed | 2026-10-06 |
 
 ## Template
 

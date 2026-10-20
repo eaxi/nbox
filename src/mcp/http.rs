@@ -61,6 +61,7 @@ use super::oidc::{
     self, AuthError, Identity, JwksCache, OidcConfig, SCOPE_READ, SCOPE_WRITE,
     require_https_or_loopback,
 };
+use super::passthrough::{self, PassthroughToken, Placement};
 use crate::error::NboxError;
 use crate::netbox::client::NetBoxClient;
 
@@ -192,6 +193,23 @@ struct GateState {
     guard: Guard,
     allowed_hosts: Arc<AllowedHosts>,
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// `Some` ⇒ NetBox API-token pass-through is on, and this is where the
+    /// caller's token may ride. `None` ⇒ single-credential mode (the profile's
+    /// service token does the last hop), exactly as before.
+    passthrough: Option<Placement>,
+}
+
+impl GateState {
+    /// The [`AuthMode`] for a request rejected before auth resolves (the pre-auth
+    /// peer-IP 429). Defers to the guard, except that a pass-through-only
+    /// deployment (no OIDC, no static bearer) is honestly `netbox-token` rather
+    /// than `loopback` — the caller's NetBox token is its one credential.
+    fn unauth_mode(&self) -> AuthMode {
+        match self.guard.unauth_mode() {
+            AuthMode::Loopback if self.passthrough.is_some() => AuthMode::NetBoxToken,
+            mode => mode,
+        }
+    }
 }
 
 /// Operational inputs for [`serve_http`], grouped so the call site stays one
@@ -217,6 +235,16 @@ pub struct ServeOptions {
     /// The active profile name — bound into the confirmation token so a plan
     /// from one profile can't be applied under another.
     pub profile: String,
+    /// NetBox API-token pass-through (multi-user mode). When `true`, every
+    /// `/mcp` request must carry the caller's own NetBox API token, which nbox
+    /// forwards verbatim to NetBox for that request — so one server instance
+    /// serves many users under their own NetBox identity and permissions, and
+    /// the profile's service token is never used for their reads or writes.
+    pub netbox_token_passthrough: bool,
+    /// Whether write tools are enabled. Only consulted in pass-through mode
+    /// (the caller's own token authorizes the write, so no vault is involved);
+    /// the vault path keeps using `vault`'s own gate.
+    pub allow_writes: bool,
 }
 
 /// Serve the MCP server over HTTP until interrupted.
@@ -236,23 +264,35 @@ pub async fn serve_http(client: NetBoxClient, addr: &str, opts: ServeOptions) ->
         cache,
         vault,
         profile,
+        netbox_token_passthrough,
+        allow_writes,
     } = opts;
     let oidc_on = oidc.is_some();
-    let socket = parse_bind_addr(addr, oidc_on)?;
-    if oidc_on && !is_loopback(socket.ip()) {
+    // Pass-through is a second, independent reason a routable bind is safe: every
+    // caller authenticates to NetBox with their own credential, so nbox holds no
+    // ambient authority to expose. Both modes still need TLS in front.
+    let routable_ok = oidc_on || netbox_token_passthrough;
+    let socket = parse_bind_addr(addr, routable_ok)?;
+    if routable_ok && !is_loopback(socket.ip()) {
         tracing::warn!(
             %socket,
             "binding a non-loopback address — terminate TLS in front (reverse proxy); \
-             nbox serves plain HTTP and validates inbound IdP JWTs but does not do TLS"
+             nbox serves plain HTTP and does not do TLS"
         );
     }
+    // Where the caller's NetBox token may ride. `Authorization` is off-limits
+    // when it already carries another credential (an OIDC JWT or the static
+    // bearer) — forwarding a JWT to NetBox as an API token would be a bug.
+    let placement = netbox_token_passthrough.then(|| Placement::resolve(oidc_on, token.is_some()));
 
     // Build the allowed-host set for the DNS-rebinding defense. Loopback mode is
     // strict (loopback-only — operator `--allowed-host` is ignored there, by
     // design). OIDC mode adds the `--audience` host (nbox's own identity) plus any
     // `--allowed-host` entries, so a real proxied request with the deployment's
-    // `Host` passes both rmcp's check and our `Origin` check.
-    let allowed_hosts = if oidc_on {
+    // `Host` passes both rmcp's check and our `Origin` check. Pass-through has no
+    // audience of its own, so its routable deployments name their host(s) with
+    // `--allowed-host`.
+    let allowed_hosts = if routable_ok {
         let audience = oidc.as_ref().map(|a| a.audience.as_str());
         let allowed = build_allowed_hosts(audience, &extra_hosts)?;
         if !allowed.extra.is_empty() {
@@ -268,7 +308,7 @@ pub async fn serve_http(client: NetBoxClient, addr: &str, opts: ServeOptions) ->
         if !extra_hosts.is_empty() {
             tracing::warn!(
                 "--allowed-host is ignored in loopback mode (the allow-list stays loopback-only); \
-                 it applies only with --oidc-issuer"
+                 it applies only with --oidc-issuer or --netbox-token-passthrough"
             );
         }
         AllowedHosts::default()
@@ -292,12 +332,23 @@ pub async fn serve_http(client: NetBoxClient, addr: &str, opts: ServeOptions) ->
         guard: guard.clone(),
         allowed_hosts: allowed_hosts.clone(),
         rate_limiter,
+        passthrough: placement,
     };
 
     // Build the server once; the service factory hands rmcp a fresh clone per
     // session (cheap — `NboxMcp` holds an `Arc<NetBoxClient>` and a cheaply-cloned
     // `Cache` sharing one store, so all sessions share the cache).
-    let server = NboxMcp::new(client, cache, vault, profile);
+    let server = if netbox_token_passthrough {
+        tracing::info!(
+            placement = ?placement,
+            writes = allow_writes,
+            "NetBox API-token pass-through enabled — each caller's own token is \
+             forwarded to NetBox (the profile's service token is not used for tool calls)"
+        );
+        NboxMcp::new_passthrough(client, cache, profile, allow_writes)
+    } else {
+        NboxMcp::new(client, cache, vault, profile)
+    };
 
     let cancel = CancellationToken::new();
     // `StreamableHttpServerConfig` is `#[non_exhaustive]`, so build from the
@@ -393,22 +444,24 @@ async fn build_oidc_config(args: OidcArgs) -> Result<OidcConfig> {
     })
 }
 
-/// Parse `addr` to a [`SocketAddr`]. In loopback mode (`!oidc`) it must be a
-/// loopback address; a routable bind is rejected as a [`NboxError::Usage`] (exit
-/// `2`) pointing at `--oidc-issuer`. In OIDC mode any address is allowed (the
-/// caller warns about TLS for non-loopback binds).
-fn parse_bind_addr(addr: &str, oidc: bool) -> Result<SocketAddr> {
+/// Parse `addr` to a [`SocketAddr`]. Without a per-caller auth mode
+/// (`!routable_ok`) it must be a loopback address; a routable bind is rejected as
+/// a [`NboxError::Usage`] (exit `2`) pointing at `--oidc-issuer` /
+/// `--netbox-token-passthrough`. With one, any address is allowed (the caller
+/// warns about TLS for non-loopback binds).
+fn parse_bind_addr(addr: &str, routable_ok: bool) -> Result<SocketAddr> {
     let socket: SocketAddr = addr.parse().map_err(|_| {
         NboxError::Usage(format!(
             "--http expects an IP:PORT address, e.g. 127.0.0.1:8080 (got \"{addr}\")"
         ))
     })?;
-    if !oidc && !is_loopback(socket.ip()) {
+    if !routable_ok && !is_loopback(socket.ip()) {
         return Err(NboxError::Usage(format!(
             "--http {addr} is not a loopback address. Binding a routable interface \
-             requires the OIDC resource-server auth mode — pass --oidc-issuer <URL> \
-             and --audience <VALUE> (and terminate TLS in front). Loopback (127.0.0.0/8 \
-             or ::1) needs neither."
+             requires a per-caller auth mode — either the OIDC resource server \
+             (--oidc-issuer <URL> and --audience <VALUE>) or NetBox API-token \
+             pass-through (--netbox-token-passthrough), and TLS terminated in front. \
+             Loopback (127.0.0.0/8 or ::1) needs neither."
         ))
         .into());
     }
@@ -628,6 +681,7 @@ async fn gate(State(state): State<GateState>, request: Request<Body>, next: Next
     let GateOutcome {
         auth_mode,
         identity,
+        netbox_token,
         mut response,
     } = gate_inner(&state, request, next).await;
 
@@ -641,6 +695,7 @@ async fn gate(State(state): State<GateState>, request: Request<Body>, next: Next
         &request_id,
         auth_mode,
         identity.as_ref(),
+        netbox_token.as_ref(),
         peer,
         &method,
         &path,
@@ -657,6 +712,9 @@ async fn gate(State(state): State<GateState>, request: Request<Body>, next: Next
 struct GateOutcome {
     auth_mode: AuthMode,
     identity: Option<Identity>,
+    /// The caller's NetBox API token in pass-through mode, for attribution. Only
+    /// its fingerprint is ever logged.
+    netbox_token: Option<PassthroughToken>,
     response: Response,
 }
 
@@ -686,8 +744,9 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
         // The request hasn't authenticated yet; attribute the 429 to the mode the
         // guard would use and no identity (no secret to leak).
         return GateOutcome {
-            auth_mode: state.guard.unauth_mode(),
+            auth_mode: state.unauth_mode(),
             identity: None,
+            netbox_token: None,
             response: too_many_requests(retry_after_secs),
         };
     }
@@ -708,6 +767,7 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
                     return GateOutcome {
                         auth_mode: AuthMode::StaticBearer,
                         identity: None,
+                        netbox_token: None,
                         response: loopback_unauthorized(),
                     };
                 }
@@ -729,6 +789,7 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
                         return GateOutcome {
                             auth_mode: AuthMode::Oidc,
                             identity: Some(identity),
+                            netbox_token: None,
                             response: oidc_challenge(cfg, &scope_err),
                         };
                     }
@@ -738,11 +799,49 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
                     return GateOutcome {
                         auth_mode: AuthMode::Oidc,
                         identity: None,
+                        netbox_token: None,
                         response: oidc_challenge(cfg, &e),
                     };
                 }
             }
         }
+    };
+
+    // 1b) NetBox API-token pass-through: resolve the caller's own NetBox token.
+    //     This is what makes the server multi-user — the token is forwarded
+    //     verbatim on the last hop, so NetBox's object permissions (and its
+    //     change log) apply per user instead of per service account. It is an
+    //     auth factor in its own right: no token ⇒ rejected here, before any
+    //     NetBox call and before the request can reach a tool.
+    //
+    //     When pass-through is off this is `None` and nothing downstream
+    //     changes — the profile's service token still does the last hop.
+    let netbox_token = match state.passthrough {
+        Some(placement) => match passthrough::extract(request.headers(), placement) {
+            Some(token) => Some(token),
+            None => {
+                return GateOutcome {
+                    auth_mode: AuthMode::NetBoxToken,
+                    identity,
+                    netbox_token: None,
+                    // Already authenticated by OIDC / the static bearer ⇒ 403
+                    // without a challenge, so an OAuth client doesn't read it
+                    // as a rejected JWT and loop re-auth.
+                    response: missing_netbox_token(
+                        placement,
+                        !matches!(auth_mode, AuthMode::Loopback),
+                    ),
+                };
+            }
+        },
+        None => None,
+    };
+    // Record the pass-through mode when it is the *only* caller credential; an
+    // OIDC/static-bearer deployment keeps naming its own outer factor.
+    let auth_mode = if netbox_token.is_some() && matches!(auth_mode, AuthMode::Loopback) {
+        AuthMode::NetBoxToken
+    } else {
+        auth_mode
     };
 
     // 2) Origin validation (DNS-rebinding defense), in BOTH modes. A request that
@@ -761,6 +860,7 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
             return GateOutcome {
                 auth_mode,
                 identity,
+                netbox_token,
                 response: forbidden(),
             };
         }
@@ -773,7 +873,7 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
     //    identity), skip it — that single logical request is not charged twice to
     //    the one bucket. An OIDC `sub`/`client` caller has a distinct bucket, so it
     //    honors both the coarse peer-IP cap and its own per-caller cap.
-    let caller = audit::caller_key(identity.as_ref(), peer);
+    let caller = audit::caller_key_with_token(identity.as_ref(), netbox_token.as_ref(), peer);
     if caller != peer_key
         && let Some(rl) = &state.rate_limiter
         && let RateDecision::Limited { retry_after_secs } = rl.check(&caller)
@@ -781,6 +881,7 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
         return GateOutcome {
             auth_mode,
             identity,
+            netbox_token,
             response: too_many_requests(retry_after_secs),
         };
     }
@@ -790,11 +891,19 @@ async fn gate_inner(state: &GateState, mut request: Request<Body>, next: Next) -
     if let Some(id) = &identity {
         request.extensions_mut().insert(id.clone());
     }
+    // Same handoff for the pass-through token: the tool layer reads it back out
+    // of the originating request `Parts` and builds a per-request NetBox client
+    // from it. It is deliberately NOT bound to the MCP session — every request
+    // carries (and is authorized by) its own token.
+    if let Some(token) = &netbox_token {
+        request.extensions_mut().insert(token.clone());
+    }
 
     let response = next.run(request).await;
     GateOutcome {
         auth_mode,
         identity,
+        netbox_token,
         response,
     }
 }
@@ -822,6 +931,7 @@ fn audit(
     request_id: &str,
     auth: AuthMode,
     identity: Option<&Identity>,
+    netbox_token: Option<&PassthroughToken>,
     peer: Option<IpAddr>,
     method: &str,
     path: &str,
@@ -830,7 +940,7 @@ fn audit(
     start: Instant,
 ) {
     let status = response.status().as_u16();
-    let caller = audit::caller_key(identity, peer);
+    let caller = audit::caller_key_with_token(identity, netbox_token, peer);
     // Space-join the scopes for a compact, greppable field; `None` when empty.
     let scope = identity.and_then(|id| {
         if id.scopes.is_empty() {
@@ -851,6 +961,7 @@ fn audit(
         method,
         path,
         session,
+        netbox_token_fp: netbox_token.map(PassthroughToken::fingerprint),
         status,
         outcome: Outcome::from_status(status),
         latency_ms: start.elapsed().as_millis(),
@@ -976,6 +1087,38 @@ fn loopback_unauthorized() -> Response {
     response.headers_mut().insert(
         header::WWW_AUTHENTICATE,
         header::HeaderValue::from_static("Bearer"),
+    );
+    response
+}
+
+/// Rejection for a pass-through request that carried no usable NetBox API token.
+///
+/// The body names the accepted headers for the deployment's [`Placement`], so a
+/// client that put the token in the wrong place is told where it belongs.
+/// Unauthenticated: `401` with a `Bearer` `invalid_request` challenge (RFC
+/// 6750). `authenticated` (OIDC or the static bearer already passed): `403`
+/// with no challenge — the caller's own auth is fine, only the NetBox token is
+/// missing. A token NetBox itself refuses surfaces as the tool's own error.
+fn missing_netbox_token(placement: Placement, authenticated: bool) -> Response {
+    if authenticated {
+        let mut response = Response::new(Body::from(format!(
+            "Forbidden: this nbox server runs in NetBox API-token pass-through mode — {}",
+            placement.hint()
+        )));
+        *response.status_mut() = StatusCode::FORBIDDEN;
+        return response;
+    }
+    let mut response = Response::new(Body::from(format!(
+        "Unauthorized: this nbox server runs in NetBox API-token pass-through mode — {}",
+        placement.hint()
+    )));
+    *response.status_mut() = StatusCode::UNAUTHORIZED;
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        header::HeaderValue::from_static(
+            "Bearer realm=\"nbox\", error=\"invalid_request\", \
+             error_description=\"a NetBox API token is required\"",
+        ),
     );
     response
 }
@@ -1577,19 +1720,31 @@ mod rs_tests {
     /// A stub `/mcp` handler standing in for the rmcp service. Returns 200 and
     /// echoes the validated identity (proving the gate plumbed it into the
     /// request extensions) when present.
-    async fn stub_mcp(identity: Option<Extension<Identity>>) -> Response {
-        match identity {
-            Some(Extension(id)) => {
-                let body = format!(
-                    "ok sub={} client={} scopes={}",
-                    id.sub.as_deref().unwrap_or("-"),
-                    id.client_id.as_deref().unwrap_or("-"),
-                    id.scopes.join(",")
-                );
-                (StatusCode::OK, body).into_response()
-            }
-            None => (StatusCode::OK, "ok").into_response(),
+    async fn stub_mcp(
+        identity: Option<Extension<Identity>>,
+        netbox_token: Option<Extension<PassthroughToken>>,
+    ) -> Response {
+        let mut body = match identity {
+            Some(Extension(id)) => format!(
+                "ok sub={} client={} scopes={}",
+                id.sub.as_deref().unwrap_or("-"),
+                id.client_id.as_deref().unwrap_or("-"),
+                id.scopes.join(",")
+            ),
+            None => "ok".to_string(),
+        };
+        // Echo the pass-through handoff so tests can assert the gate reached the
+        // inner service with (and only with) the caller's own token.
+        if let Some(Extension(token)) = netbox_token {
+            use std::fmt::Write as _;
+            let _ = write!(
+                body,
+                " nbtoken={} raw={}",
+                token.fingerprint(),
+                token.as_str()
+            );
         }
+        (StatusCode::OK, body).into_response()
     }
 
     /// The gated router under test: the real `gate` + PRM route over a stub `/mcp`.
@@ -1637,10 +1792,21 @@ mod rs_tests {
         rate_limiter: Option<Arc<RateLimiter>>,
         allowed_hosts: AllowedHosts,
     ) -> Router {
+        router_with_passthrough(guard, rate_limiter, allowed_hosts, None)
+    }
+
+    /// Build the gated router with NetBox API-token pass-through configured.
+    fn router_with_passthrough(
+        guard: Guard,
+        rate_limiter: Option<Arc<RateLimiter>>,
+        allowed_hosts: AllowedHosts,
+        passthrough: Option<Placement>,
+    ) -> Router {
         let state = GateState {
             guard: guard.clone(),
             allowed_hosts: Arc::new(allowed_hosts),
             rate_limiter,
+            passthrough,
         };
         let mut router = Router::new()
             .route("/mcp", any(stub_mcp))
@@ -2715,5 +2881,176 @@ mod rs_tests {
         }
         // The old field name is gone (it's now `session`).
         assert_eq!(e.get("session_id"), None);
+    }
+    // ---------------------------------------------------------------------
+    // NetBox API-token pass-through (multi-user mode)
+    // ---------------------------------------------------------------------
+
+    /// A `GET /mcp` request carrying the given raw headers.
+    fn mcp_request_with(headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().uri("/mcp").method("GET");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    /// The pass-through router: no other auth factor, so `Authorization` is free.
+    fn passthrough_router() -> Router {
+        router_with_passthrough(
+            Guard::Loopback { token: None },
+            None,
+            AllowedHosts::default(),
+            Some(Placement::Authorization),
+        )
+    }
+
+    #[tokio::test]
+    async fn passthrough_rejects_a_request_with_no_netbox_token() {
+        let (status, www, body) = send(passthrough_router(), mcp_request(None)).await;
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "a pass-through server must not serve an anonymous request: {body}"
+        );
+        let www = www.expect("a WWW-Authenticate challenge");
+        assert!(www.contains("invalid_request"), "{www}");
+        // The body tells the client where the token belongs.
+        assert!(body.contains("X-NetBox-Token"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_forwards_the_callers_token_to_the_inner_service() {
+        for header_pair in [
+            ("x-netbox-token", "nbt_alice"),
+            ("authorization", "Bearer nbt_alice"),
+            ("authorization", "Token nbt_alice"),
+        ] {
+            let (status, _www, body) =
+                send(passthrough_router(), mcp_request_with(&[header_pair])).await;
+            assert_eq!(status, StatusCode::OK, "for {header_pair:?}: {body}");
+            assert!(
+                body.contains("raw=nbt_alice"),
+                "the caller's own token must reach the tool layer for {header_pair:?}: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_with_a_static_bearer_requires_the_dedicated_header() {
+        // Authorization carries nbox's own static bearer; the NetBox token must
+        // therefore ride in X-NetBox-Token and must never be read from
+        // Authorization (that would forward nbox's bearer to NetBox).
+        let router = router_with_passthrough(
+            Guard::Loopback {
+                token: Some(Arc::from("s3cret")),
+            },
+            None,
+            AllowedHosts::default(),
+            Some(Placement::DedicatedHeaderOnly),
+        );
+        let (status, www, body) = send(
+            router.clone(),
+            mcp_request_with(&[("authorization", "Bearer s3cret")]),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "the static bearer alone is not a NetBox token: {body}"
+        );
+        assert!(
+            www.is_none(),
+            "an authenticated caller must not get a Bearer challenge"
+        );
+
+        let (status, _www, body) = send(
+            router,
+            mcp_request_with(&[
+                ("authorization", "Bearer s3cret"),
+                ("x-netbox-token", "nbt_alice"),
+            ]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(body.contains("raw=nbt_alice"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn passthrough_audits_the_fingerprint_and_never_the_token() {
+        let (events, _guard) = capture();
+        let (status, _www, _body) = send(
+            passthrough_router(),
+            mcp_request_with(&[("x-netbox-token", "nbt_supersecret")]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let e = &events[0];
+        let expected = PassthroughToken::new("nbt_supersecret").unwrap();
+        assert_eq!(e.get("auth"), Some("netbox-token"));
+        assert_eq!(e.get("netbox_token_fp"), Some(expected.fingerprint()));
+        // The caller key (audit attribution + rate-limit bucket) is the
+        // fingerprint, so two users behind one proxy are told apart.
+        assert_eq!(e.get("caller"), Some(expected.caller_key().as_str()));
+        for (name, value) in &e.fields {
+            assert!(
+                !value.contains("nbt_supersecret"),
+                "audit field {name} leaked the caller's NetBox token: {value}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_rate_limit_bucket_follows_the_token() {
+        // The rate limiter has two layers (unchanged by pass-through): a coarse
+        // pre-auth cap keyed on the peer IP, then a per-caller cap. This pins the
+        // second layer — the per-caller bucket is the caller's *token*, not their
+        // address. Each request below comes from a different peer IP so the
+        // coarse layer never fires and the token bucket is what's observed.
+        let router = router_with_passthrough(
+            Guard::Loopback { token: None },
+            Some(Arc::new(RateLimiter::new(1).unwrap())),
+            AllowedHosts::default(),
+            Some(Placement::Authorization),
+        );
+        let request = |token: &str, ip: &str| {
+            let mut req = mcp_request_with(&[("x-netbox-token", token)]);
+            req.extensions_mut()
+                .insert(ConnectInfo(SocketAddr::new(ip.parse().unwrap(), 4000)));
+            req
+        };
+
+        let (status, _, body) = send(router.clone(), request("nbt_alice", "10.0.0.1")).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        // A different token from a different address: its own, untouched bucket.
+        let (status, _, body) = send(router.clone(), request("nbt_bob", "10.0.0.2")).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "a second user must not inherit the first user's bucket: {body}"
+        );
+
+        // Alice again from a *third* address — throttled anyway, because the
+        // bucket travels with her token. Changing IP is not a way around the cap.
+        let (status, _, _) = send(router, request("nbt_alice", "10.0.0.3")).await;
+        assert_eq!(
+            status,
+            StatusCode::TOO_MANY_REQUESTS,
+            "the per-caller cap must key on the token, not the peer address"
+        );
+    }
+
+    #[test]
+    fn passthrough_permits_a_routable_bind() {
+        // Without any per-caller auth mode a routable bind is a usage error...
+        assert!(parse_bind_addr("0.0.0.0:8080", false).is_err());
+        // ...but pass-through authenticates every caller individually, so it is
+        // allowed (the caller warns about TLS).
+        let socket = parse_bind_addr("0.0.0.0:8080", true).expect("routable bind");
+        assert_eq!(socket.port(), 8080);
     }
 }

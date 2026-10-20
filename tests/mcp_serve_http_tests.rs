@@ -840,3 +840,294 @@ async fn oidc_write_rejected_for_unmapped_sub() {
         "no NetBox call on a vault miss"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Pattern 4: NetBox API-token pass-through (multi-user)
+// ---------------------------------------------------------------------------
+
+/// Spawn `nbox serve --http --netbox-token-passthrough` against `netbox_url`.
+/// No `token_env`/`NBOX_TOKEN` service credential is configured that NetBox
+/// would accept: every request must be authenticated by the caller's own token
+/// or not at all.
+fn spawn_passthrough(netbox_url: &str) -> HttpServer {
+    let port = free_port();
+    let addr = format!("127.0.0.1:{port}");
+    let mut config = NamedTempFile::new().expect("create temp config");
+    write!(
+        config,
+        "active_profile = \"test\"\n\
+         \n\
+         [profiles.test]\n\
+         url = \"{netbox_url}\"\n\
+         token_env = \"NBOX_TOKEN\"\n\
+         \n\
+         [serve]\n\
+         netbox_token_passthrough = true\n",
+    )
+    .expect("write temp config");
+    config.flush().expect("flush temp config");
+
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_nbox"));
+    cmd.arg("--config")
+        .arg(config.path())
+        .arg("serve")
+        .arg("--http")
+        .arg(&addr)
+        .arg("--allowed-host")
+        .arg("127.0.0.1")
+        .env("NBOX_TOKEN", "service-token-that-netbox-rejects")
+        .env_remove("NBOX_SERVE_TOKEN")
+        .env_remove("NBOX_LOG")
+        .env_remove("RUST_LOG")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = cmd.spawn().expect("spawn nbox serve --http (pass-through)");
+    let server = HttpServer {
+        child,
+        base: format!("http://{addr}"),
+        _config: config,
+    };
+    server.wait_until_ready();
+    server
+}
+
+/// Mount `/api/dcim/sites/` so each caller's token yields a *different* site.
+/// The site name is therefore a direct readout of which credential reached
+/// NetBox, which is what makes the isolation assertions meaningful.
+async fn mount_site_per_token(netbox: &MockServer, pairs: &[(&str, &str)]) {
+    for (token, site) in pairs {
+        let auth = format!("Token {token}");
+        Mock::given(method("GET"))
+            .and(path("/api/dcim/sites/"))
+            .and(header("authorization", auth.as_str()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1, "next": null, "previous": null,
+                "results": [{
+                    "id": 1,
+                    "url": format!("{}/api/dcim/sites/1/", netbox.uri()),
+                    "name": site,
+                    "slug": "shared",
+                    "status": { "value": "active", "label": "Active" },
+                }]
+            })))
+            .mount(netbox)
+            .await;
+    }
+    // Anything else (notably the service token) is rejected the way NetBox would.
+    Mock::given(method("GET"))
+        .and(path("/api/dcim/sites/"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "detail": "Invalid token."
+        })))
+        .mount(netbox)
+        .await;
+    for p in [
+        "/api/dcim/racks/",
+        "/api/dcim/devices/",
+        "/api/ipam/prefixes/",
+        "/api/ipam/vlans/",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(p))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 0, "next": null, "previous": null, "results": []
+            })))
+            .mount(netbox)
+            .await;
+    }
+}
+
+/// POST to `/mcp` with the caller's NetBox token in the dedicated header.
+async fn post_as(
+    client: &reqwest::Client,
+    url: &str,
+    body: &Value,
+    session: Option<&str>,
+    netbox_token: &str,
+) -> reqwest::Response {
+    let mut req = client
+        .post(url)
+        .header("accept", "application/json, text/event-stream")
+        .header("content-type", "application/json")
+        .header("x-netbox-token", netbox_token)
+        .json(body);
+    if let Some(sid) = session {
+        req = req.header("mcp-session-id", sid);
+    }
+    req.send().await.expect("send POST /mcp")
+}
+
+/// Handshake as a pass-through caller, returning the session id.
+async fn handshake_as(client: &reqwest::Client, url: &str, netbox_token: &str) -> String {
+    let init = post_as(
+        client,
+        url,
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "nbox-passthrough-e2e", "version": "0.0.0" }
+            }
+        }),
+        None,
+        netbox_token,
+    )
+    .await;
+    assert_eq!(init.status(), StatusCode::OK, "initialize should be 200");
+    let session = init
+        .headers()
+        .get("mcp-session-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("initialize must return an Mcp-Session-Id")
+        .to_string();
+    let _ = read_sse_for_id(init, 1).await;
+    let ack = post_as(
+        client,
+        url,
+        &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        Some(&session),
+        netbox_token,
+    )
+    .await;
+    assert_eq!(ack.status(), StatusCode::ACCEPTED);
+    session
+}
+
+/// Call a tool as a pass-through caller.
+async fn call_tool_as(
+    client: &reqwest::Client,
+    url: &str,
+    session: &str,
+    netbox_token: &str,
+    id: i64,
+    name: &str,
+    arguments: Value,
+) -> Value {
+    let resp = post_as(
+        client,
+        url,
+        &json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": name, "arguments": arguments },
+        }),
+        Some(session),
+        netbox_token,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK, "tools/call {name} status");
+    read_sse_for_id(resp, id).await
+}
+
+#[tokio::test]
+async fn passthrough_serves_two_users_under_their_own_netbox_tokens() {
+    let netbox = MockServer::start().await;
+    mount_site_per_token(
+        &netbox,
+        &[("tok-alice", "ALICE-SITE"), ("tok-bob", "BOB-SITE")],
+    )
+    .await;
+    let server = spawn_passthrough(&netbox.uri());
+    let client = reqwest::Client::new();
+    let url = server.mcp_url();
+
+    // Two independent sessions on one server process.
+    let alice = handshake_as(&client, &url, "tok-alice").await;
+    let bob = handshake_as(&client, &url, "tok-bob").await;
+
+    let args = json!({ "kind": "site", "ref": "shared" });
+    let a = call_tool_as(
+        &client,
+        &url,
+        &alice,
+        "tok-alice",
+        2,
+        "nbox_get",
+        args.clone(),
+    )
+    .await;
+    assert_eq!(tool_payload(&a)["name"], json!("ALICE-SITE"), "{a}");
+
+    let b = call_tool_as(&client, &url, &bob, "tok-bob", 3, "nbox_get", args.clone()).await;
+    assert_eq!(
+        tool_payload(&b)["name"],
+        json!("BOB-SITE"),
+        "Bob must see his own NetBox view, not Alice's: {b}"
+    );
+
+    // Back to Alice on her existing session: the token is read per request, so a
+    // long-lived session keeps resolving to the right caller.
+    let a2 = call_tool_as(&client, &url, &alice, "tok-alice", 4, "nbox_get", args).await;
+    assert_eq!(tool_payload(&a2)["name"], json!("ALICE-SITE"), "{a2}");
+}
+
+#[tokio::test]
+async fn passthrough_rejects_a_request_without_a_caller_token() {
+    let netbox = MockServer::start().await;
+    mount_site_per_token(&netbox, &[("tok-alice", "ALICE-SITE")]).await;
+    let server = spawn_passthrough(&netbox.uri());
+    let client = reqwest::Client::new();
+
+    // No `X-NetBox-Token`: refused at the gate, before any MCP handling — and
+    // emphatically *not* silently downgraded to the server's service token.
+    let resp = post(
+        &client,
+        &server.mcp_url(),
+        &json!({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": { "name": "anon", "version": "0.0.0" }
+            }
+        }),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let body = resp.text().await.unwrap_or_default();
+    assert!(
+        body.to_lowercase().contains("netbox"),
+        "the 401 should name the missing credential: {body}"
+    );
+    assert!(
+        netbox.received_requests().await.unwrap().is_empty(),
+        "an unauthenticated caller must never reach NetBox"
+    );
+}
+
+#[test]
+fn passthrough_is_rejected_on_stdio() {
+    // stdio has no per-request headers, so there is no caller token to forward.
+    // Fail loudly at startup rather than quietly keeping the service token.
+    let mut config = NamedTempFile::new().expect("create temp config");
+    write!(
+        config,
+        "active_profile = \"test\"\n\
+         \n\
+         [profiles.test]\n\
+         url = \"http://127.0.0.1:1/\"\n\
+         token_env = \"NBOX_TOKEN\"\n"
+    )
+    .expect("write temp config");
+    config.flush().expect("flush temp config");
+
+    let out = Command::new(env!("CARGO_BIN_EXE_nbox"))
+        .arg("--config")
+        .arg(config.path())
+        .arg("serve")
+        .arg("--netbox-token-passthrough")
+        .env("NBOX_TOKEN", "dummy")
+        .env_remove("NBOX_SERVE_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run nbox serve");
+    assert_eq!(out.status.code(), Some(2), "usage errors exit 2");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--http"),
+        "the error should point at the HTTP transport: {stderr}"
+    );
+}

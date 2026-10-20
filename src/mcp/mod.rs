@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
 use rmcp::model::{
-    GetPromptRequestParams, GetPromptResponse, JsonObject, ListPromptsResult,
+    Extensions, GetPromptRequestParams, GetPromptResponse, JsonObject, ListPromptsResult,
     ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams, ProtocolVersion,
     ReadResourceRequestParams, ReadResourceResponse, ReadResourceResult, ResourceContents,
     ResourceTemplate, ServerCapabilities, ServerInfo,
@@ -52,6 +52,15 @@ pub struct NboxMcp {
     /// Per-user credential vault for write tools (Pattern 2). Absent ⇒ writes
     /// cannot use the shared HTTP/OIDC path. See [`vault::CredentialVault`].
     vault: Option<Arc<vault::CredentialVault>>,
+    /// NetBox API-token pass-through (Pattern 4): the caller's own NetBox token
+    /// rides on each HTTP request and is used for that request's NetBox calls.
+    /// When `true`, [`client`](Self::client) is only a *template* — it supplies
+    /// the base URL, TLS/timeout settings, and paging, while the credential
+    /// comes from the request. A tool call that reaches this server without a
+    /// token in pass-through mode is an internal error (the HTTP gate 401s
+    /// first), and is rejected rather than silently falling back to the shared
+    /// service token.
+    passthrough: bool,
     /// Transport/write-mode facts for the write tools. Local writes are allowed
     /// only for stdio servers with `local_writes = true`.
     write_mode: write::WriteMode,
@@ -416,6 +425,116 @@ fn project_search_hits(report: SearchReport, fields: &[String]) -> serde_json::V
     value
 }
 
+/// Everything one tool call needs that can differ *per request*: the NetBox
+/// client to talk to, and the cache partition its results belong in.
+///
+/// In the single-credential modes (stdio, loopback, static bearer, OIDC + vault)
+/// this is just the server's own shared client and cache — one connection, one
+/// partition, exactly as before. In NetBox API-token pass-through mode it is
+/// rebuilt per request from the caller's token:
+///
+/// - **client** — the template client with the caller's token swapped in
+///   ([`NetBoxClient::with_token`]), so NetBox applies *that user's* object
+///   permissions and records *their* name in its change log.
+/// - **cache** — a partition keyed by the token's SHA-256 digest. This is not an
+///   optimization detail but a correctness requirement: NetBox filters read
+///   results by permission, so a shared partition would let one user's cached
+///   view of an object be served to another user who may not be allowed to see
+///   it. Separate partitions make that impossible.
+/// - **caller** — the digest, used as the write actor so a plan issued to
+///   one token can only be applied by that same token.
+#[derive(Clone)]
+pub(crate) struct RequestScope {
+    client: Arc<NetBoxClient>,
+    cache: Cache,
+    /// `Some(full token digest)` in pass-through mode; `None` otherwise.
+    caller: Option<String>,
+    /// `Some(has nbox:write)` when an OIDC identity also authenticated this
+    /// request (pass-through layered on OIDC); `None` otherwise.
+    oidc_write_scope: Option<bool>,
+}
+
+impl RequestScope {
+    /// The client this request's NetBox calls must use.
+    pub(crate) fn client(&self) -> &NetBoxClient {
+        &self.client
+    }
+
+    /// The caller's full NetBox-token digest, when the request carried one.
+    pub(crate) fn caller(&self) -> Option<&str> {
+        self.caller.as_deref()
+    }
+}
+
+impl NboxMcp {
+    /// Resolve the [`RequestScope`] for one tool call from its request
+    /// [`Extensions`].
+    ///
+    /// Fails closed: with pass-through enabled and no token on the request, this
+    /// errors instead of falling back to the shared service token. The HTTP gate
+    /// already 401s such a request, so reaching here means the transport changed
+    /// underneath us — silently using the service token would turn a multi-user
+    /// server back into a single-credential one without anyone noticing.
+    pub(crate) fn scope_from_extensions(
+        &self,
+        ext: &rmcp::model::Extensions,
+    ) -> Result<RequestScope, ErrorData> {
+        if !self.passthrough {
+            return Ok(self.base_scope());
+        }
+        #[cfg(feature = "http")]
+        if let Some(parts) = ext.get::<axum::http::request::Parts>()
+            && let Some(token) = parts.extensions.get::<passthrough::PassthroughToken>()
+        {
+            let key = token.key().to_string();
+            return Ok(RequestScope {
+                client: Arc::new(self.client.with_token(token.as_str().to_string())),
+                // Per-user partition: see the type docs — cached reads must never
+                // cross a NetBox permission boundary. Keyed on the full digest, not
+                // the short log fingerprint: a cache hit never reaches NetBox, so a
+                // collision would serve another user's data.
+                cache: self
+                    .cache
+                    .with_partition(format!("{}|token:{key}", self.profile_partition_label())),
+                caller: Some(key),
+                // Pass-through layered on OIDC still honors the JWT's scopes for
+                // writes (ADR-0001 §7).
+                oidc_write_scope: parts
+                    .extensions
+                    .get::<oidc::Identity>()
+                    .map(|id| id.has_scope(SCOPE_WRITE)),
+            });
+        }
+        #[cfg(not(feature = "http"))]
+        let _ = ext;
+        Err(ErrorData::invalid_params(
+            "this nbox server runs in NetBox API-token pass-through mode, but this \
+             request carried no NetBox API token; send it as `X-NetBox-Token: <token>` \
+             (or `Authorization: Bearer <token>` when the server has no other auth)",
+            None,
+        ))
+    }
+
+    /// The shared scope: the server's own client and cache partition. The only
+    /// scope in every mode except pass-through.
+    pub(crate) fn base_scope(&self) -> RequestScope {
+        RequestScope {
+            client: self.client.clone(),
+            cache: self.cache.clone(),
+            caller: None,
+            oidc_write_scope: None,
+        }
+    }
+
+    /// A stable label for this server's connection, prefixed onto the per-token
+    /// cache partitions so two profiles pointed at different NetBox instances
+    /// can't share a partition even for the same token string.
+    #[cfg(feature = "http")]
+    fn profile_partition_label(&self) -> String {
+        crate::cache::profile_partition(&self.profile, self.client.base_url().as_str())
+    }
+}
+
 /// Extract the write caller's authorization facts from the tool-call request
 /// context. Over the HTTP transport the validated [`oidc::Identity`] rides in
 /// the request [`Parts`](axum::http::request::Parts) — placed there by the auth
@@ -568,7 +687,30 @@ impl NboxMcp {
         vault: Option<vault::CredentialVault>,
         profile: String,
     ) -> Self {
-        Self::new_with_write_mode(client, cache, vault, profile, write::WriteMode::Http)
+        Self::new_with_write_mode(client, cache, vault, profile, write::WriteMode::Http, false)
+    }
+
+    /// Build a multi-user HTTP server in NetBox API-token pass-through mode.
+    ///
+    /// `client` is a *template*: its URL/TLS/timeout/paging settings are reused,
+    /// but every tool call swaps in the credential the caller presented on that
+    /// request. There is no vault — the caller's own token both authenticates
+    /// them and carries their NetBox permissions, so `allow_writes` is the only
+    /// operator gate the write tools need.
+    pub fn new_passthrough(
+        client: NetBoxClient,
+        cache: Cache,
+        profile: String,
+        allow_writes: bool,
+    ) -> Self {
+        Self::new_with_write_mode(
+            client,
+            cache,
+            None,
+            profile,
+            write::WriteMode::Passthrough { allow_writes },
+            true,
+        )
     }
 
     /// Build a stdio server. `local_writes` is the ADR-0002 single-user mode:
@@ -580,6 +722,7 @@ impl NboxMcp {
             None,
             String::new(),
             write::WriteMode::stdio(local_writes),
+            false,
         )
     }
 
@@ -589,11 +732,13 @@ impl NboxMcp {
         vault: Option<vault::CredentialVault>,
         profile: String,
         write_mode: write::WriteMode,
+        passthrough: bool,
     ) -> Self {
         Self {
             client: Arc::new(client),
             cache,
             vault: vault.map(Arc::new),
+            passthrough,
             write_mode,
             profile,
             plans: Arc::new(Mutex::new(write::PlanStore::default())),
@@ -609,18 +754,20 @@ impl NboxMcp {
         description = "Show NetBox connection, active backend, versions, and a token-validity preflight (the authenticated user). Use to confirm reachability and a valid token before other lookups.",
         annotations(read_only_hint = true)
     )]
-    async fn nbox_status(&self) -> Result<Json<StatusReport>, ErrorData> {
-        let status = self.client.status().await.map_err(to_mcp_error)?;
-        let api = self.client.api_routing().await;
+    async fn nbox_status(&self, ext: Extensions) -> Result<Json<StatusReport>, ErrorData> {
+        // In pass-through mode the `token` preflight reports the *caller's*
+        // NetBox user — the natural "who am I to NetBox?" check.
+        let scope = &self.scope_from_extensions(&ext)?;
+        let client = scope.client();
+        let status = client.status().await.map_err(to_mcp_error)?;
+        let api = client.api_routing().await;
         // The credential preflight is independent of the capability probe; overlap
         // them so `nbox_status` costs no extra serial round-trip for the token
         // verdict. Neither returns a `Result`, so a plain `join!` suffices.
-        let (capabilities, token) = tokio::join!(
-            self.client.capabilities(&status),
-            self.client.authentication_check(),
-        );
+        let (capabilities, token) =
+            tokio::join!(client.capabilities(&status), client.authentication_check(),);
         Ok(Json(StatusReport {
-            netbox_url: self.client.base_url().as_str().to_string(),
+            netbox_url: client.base_url().as_str().to_string(),
             api,
             netbox_version: status.netbox_version,
             django_version: status.django_version,
@@ -641,9 +788,11 @@ impl NboxMcp {
     async fn nbox_search(
         &self,
         Parameters(args): Parameters<SearchArgs>,
+        ext: Extensions,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let fields = args.fields;
-        let outcome = Box::pin(self.client.search(SearchRequest {
+        let outcome = Box::pin(scope.client().search(SearchRequest {
             query: args.query,
             limit: args.limit.unwrap_or(25),
             filters: SearchFilters {
@@ -692,9 +841,11 @@ impl NboxMcp {
     async fn nbox_get(
         &self,
         Parameters(args): Parameters<GetArgs>,
+        ext: Extensions,
     ) -> Result<Json<serde_json::Value>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let fields = args.fields.clone();
-        let Json(value) = self.get_cached(args).await.map_err(to_mcp_error)?;
+        let Json(value) = self.get_cached(scope, args).await.map_err(to_mcp_error)?;
         // `fields` projection is applied AFTER the cache (the cache stores the
         // full object keyed by ref/scope only), so two callers asking for
         // different field subsets share one fetch.
@@ -713,8 +864,17 @@ impl NboxMcp {
         description = "Clear nbox's local read cache so the next lookups fetch fresh from NetBox. Use this after data changed in NetBox out-of-band and you need the current state before the cache TTL expires. Safe and read-only with respect to NetBox — it only drops cached copies held in this server process.",
         annotations(read_only_hint = true, idempotent_hint = true)
     )]
-    async fn nbox_cache_clear(&self) -> Result<Json<CacheClearReport>, ErrorData> {
-        self.cache.clear_all();
+    async fn nbox_cache_clear(&self, ext: Extensions) -> Result<Json<CacheClearReport>, ErrorData> {
+        // Clearing is scoped to the caller in pass-through mode: a multi-user server
+        // must not let one user drop every other user's cached reads (a trivial
+        // cross-tenant denial of service). Single-credential modes keep the original
+        // whole-cache semantics — there is only one user's data in there.
+        let scope = &self.scope_from_extensions(&ext)?;
+        if self.passthrough {
+            scope.cache.clear_profile();
+        } else {
+            self.cache.clear_all();
+        }
         Ok(Json(CacheClearReport {
             status: "cache cleared".to_string(),
         }))
@@ -729,11 +889,17 @@ impl NboxMcp {
     async fn nbox_get_interface(
         &self,
         Parameters(args): Parameters<InterfaceArgs>,
+        ext: Extensions,
     ) -> Result<Json<InterfaceView>, ErrorData> {
-        let view =
-            detail::interface_view_by_ref(&self.client, &args.device, &args.interface, &not_found)
-                .await
-                .map_err(to_mcp_error)?;
+        let scope = &self.scope_from_extensions(&ext)?;
+        let view = detail::interface_view_by_ref(
+            scope.client(),
+            &args.device,
+            &args.interface,
+            &not_found,
+        )
+        .await
+        .map_err(to_mcp_error)?;
         Ok(Json(view))
     }
 
@@ -746,14 +912,16 @@ impl NboxMcp {
     async fn nbox_next_ip(
         &self,
         Parameters(args): Parameters<NextIpArgs>,
+        ext: Extensions,
     ) -> Result<Json<AvailableReport>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let count = args.count.unwrap_or(1);
         let p = self
-            .resolve_prefix(&args.prefix, args.vrf.as_deref())
+            .resolve_prefix(scope, &args.prefix, args.vrf.as_deref())
             .await
             .map_err(to_mcp_error)?;
-        let available = self
-            .client
+        let available = scope
+            .client()
             .prefix_available_ips(p.id, count)
             .await
             .map_err(to_mcp_error)?;
@@ -777,13 +945,15 @@ impl NboxMcp {
     async fn nbox_next_prefix(
         &self,
         Parameters(args): Parameters<NextPrefixArgs>,
+        ext: Extensions,
     ) -> Result<Json<AvailableReport>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let p = self
-            .resolve_prefix(&args.prefix, args.vrf.as_deref())
+            .resolve_prefix(scope, &args.prefix, args.vrf.as_deref())
             .await
             .map_err(to_mcp_error)?;
-        let free = self
-            .client
+        let free = scope
+            .client()
             .prefix_available_prefixes(p.id)
             .await
             .map_err(to_mcp_error)?;
@@ -808,14 +978,16 @@ impl NboxMcp {
     async fn nbox_journal(
         &self,
         Parameters(args): Parameters<JournalArgs>,
+        ext: Extensions,
     ) -> Result<Json<JournalView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let limit = args.limit.unwrap_or(20);
         let (content_type, id) = self
-            .resolve_content_type_id(args.kind, &args.reference)
+            .resolve_content_type_id(scope, args.kind, &args.reference)
             .await
             .map_err(to_mcp_error)?;
-        let entries = self
-            .client
+        let entries = scope
+            .client()
             .journal_entries(content_type, id, limit)
             .await
             .map_err(to_mcp_error)?;
@@ -831,15 +1003,17 @@ impl NboxMcp {
     async fn nbox_history(
         &self,
         Parameters(args): Parameters<HistoryArgs>,
+        ext: Extensions,
     ) -> Result<Json<HistoryView>, ErrorData> {
+        let scope = &self.scope_from_extensions(&ext)?;
         let limit = args.limit.unwrap_or(20);
         let diff = args.diff.unwrap_or(false);
         let (content_type, id) = self
-            .resolve_content_type_id(args.kind, &args.reference)
+            .resolve_content_type_id(scope, args.kind, &args.reference)
             .await
             .map_err(to_mcp_error)?;
-        let changes = self
-            .client
+        let changes = scope
+            .client()
             .object_changes(content_type, id, limit)
             .await
             .map_err(to_mcp_error)?;
@@ -855,9 +1029,11 @@ impl NboxMcp {
     async fn nbox_list_tags(
         &self,
         Parameters(args): Parameters<ListTagsArgs>,
+        ext: Extensions,
     ) -> Result<Json<TagsView>, ErrorData> {
-        let tags = self
-            .client
+        let scope = &self.scope_from_extensions(&ext)?;
+        let tags = scope
+            .client()
             .tags(args.limit.unwrap_or(200))
             .await
             .map_err(to_mcp_error)?;
@@ -879,9 +1055,11 @@ impl NboxMcp {
     async fn nbox_tagged(
         &self,
         Parameters(args): Parameters<TaggedArgs>,
+        ext: Extensions,
     ) -> Result<Json<TaggedReport>, ErrorData> {
-        let tag_info = self
-            .client
+        let scope = &self.scope_from_extensions(&ext)?;
+        let tag_info = scope
+            .client()
             .tag_by_ref(&args.tag)
             .await
             .map_err(to_mcp_error)?
@@ -890,8 +1068,8 @@ impl NboxMcp {
                 // the CLI's not-found (exit 4) semantics.
                 ErrorData::invalid_params(format!("no tag matched \"{}\"", args.tag), None)
             })?;
-        let objects = self
-            .client
+        let objects = scope
+            .client()
             .tagged_objects(tag_info.id, args.limit.unwrap_or(200))
             .await
             .map_err(to_mcp_error)?;
@@ -918,7 +1096,8 @@ impl NboxMcp {
         Parameters(args): Parameters<write::PlanWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<crate::netbox::mutation::MutationPlan>, ErrorData> {
-        self.plan_write_impl(args, write_caller(&ctx)).await
+        self.plan_write_impl(args, write_caller(&ctx), &ctx.extensions)
+            .await
     }
 
     /// Apply a previously planned write. The submitted plan's `confirm_token`
@@ -935,7 +1114,8 @@ impl NboxMcp {
         Parameters(args): Parameters<write::ApplyWriteArgs>,
         ctx: RequestContext<RoleServer>,
     ) -> Result<Json<crate::netbox::mutation::MutationReceipt>, ErrorData> {
-        self.apply_write_impl(args, write_caller(&ctx)).await
+        self.apply_write_impl(args, write_caller(&ctx), &ctx.extensions)
+            .await
     }
 }
 
@@ -945,18 +1125,22 @@ impl NboxMcp {
     /// agent firing several reads of the same object collapses to one fetch. The
     /// key folds in the disambiguators so the same CIDR in two VRFs caches apart.
     /// A not-found/ambiguous error still propagates (nothing is cached for it).
-    async fn get_cached(&self, args: GetArgs) -> anyhow::Result<Json<serde_json::Value>> {
-        let scope = format!(
+    async fn get_cached(
+        &self,
+        scope: &RequestScope,
+        args: GetArgs,
+    ) -> anyhow::Result<Json<serde_json::Value>> {
+        let disambiguators = format!(
             "vrf={};site={};group={}",
             args.vrf.as_deref().unwrap_or(""),
             args.site.as_deref().unwrap_or(""),
             args.group.as_deref().unwrap_or(""),
         );
-        let key = CacheKey::object(args.kind.as_str(), &args.reference, &scope);
-        let cached = self
+        let key = CacheKey::object(args.kind.as_str(), &args.reference, &disambiguators);
+        let cached = scope
             .cache
             .get_or_fetch(&key, || async {
-                let Json(value) = self.get_impl(args.clone()).await?;
+                let Json(value) = self.get_impl(scope, args.clone()).await?;
                 Ok(value)
             })
             .await?;
@@ -968,8 +1152,12 @@ impl NboxMcp {
     /// invalid_params at the tool boundary). The fetch + view-build path is the
     /// same one the CLI handlers use (see [`crate::domain::detail`]); `not_found`
     /// supplies the MCP-flavored "use nbox_search" message.
-    async fn get_impl(&self, args: GetArgs) -> anyhow::Result<Json<serde_json::Value>> {
-        let c = &self.client;
+    async fn get_impl(
+        &self,
+        scope: &RequestScope,
+        args: GetArgs,
+    ) -> anyhow::Result<Json<serde_json::Value>> {
+        let c = scope.client();
         let r = args.reference.as_str();
         let value = match args.kind {
             GetKind::Device => {
@@ -1067,17 +1255,25 @@ impl NboxMcp {
     /// a single text content. Disambiguators (`vrf`/`site`/`group`) have no
     /// place in a flat URI, so an ambiguous `ref` surfaces its candidate list as
     /// an `invalid_params` error — the caller can then use `nbox_get`.
-    async fn read_resource_impl(&self, uri: &str) -> Result<ReadResourceResult, ErrorData> {
+    async fn read_resource_impl(
+        &self,
+        uri: &str,
+        ext: &Extensions,
+    ) -> Result<ReadResourceResult, ErrorData> {
         let (kind, reference) = parse_resource_uri(uri)?;
+        let scope = &self.scope_from_extensions(ext)?;
         let Json(value) = self
-            .get_cached(GetArgs {
-                kind,
-                reference,
-                vrf: None,
-                site: None,
-                group: None,
-                fields: None,
-            })
+            .get_cached(
+                scope,
+                GetArgs {
+                    kind,
+                    reference,
+                    vrf: None,
+                    site: None,
+                    group: None,
+                    fields: None,
+                },
+            )
             .await
             .map_err(to_mcp_error)?;
         // Pretty-print so a host that renders the resource shows readable JSON;
@@ -1093,10 +1289,11 @@ impl NboxMcp {
     /// Resolve a CIDR to a single prefix, scoped by an optional VRF reference.
     async fn resolve_prefix(
         &self,
+        scope: &RequestScope,
         cidr: &str,
         vrf: Option<&str>,
     ) -> anyhow::Result<crate::netbox::models::ipam::Prefix> {
-        detail::resolve_prefix(&self.client, cidr, vrf, &not_found).await
+        detail::resolve_prefix(scope.client(), cidr, vrf, &not_found).await
     }
 
     /// Resolve a `<kind> <ref>` to the object's dotted content type and ID, for
@@ -1107,6 +1304,7 @@ impl NboxMcp {
     /// CLI resolver itself parses the asn ref to a `u32`.
     async fn resolve_content_type_id(
         &self,
+        scope: &RequestScope,
         kind: GetKind,
         value: &str,
     ) -> anyhow::Result<(&'static str, u64)> {
@@ -1134,7 +1332,7 @@ impl NboxMcp {
             GetKind::Mac => "mac",
             GetKind::Interface => "interface",
         };
-        crate::resolve_content_type_id(&self.client, cli_kind, value).await
+        crate::resolve_content_type_id(scope.client(), cli_kind, value).await
     }
 }
 
@@ -1209,9 +1407,11 @@ impl ServerHandler for NboxMcp {
     async fn read_resource(
         &self,
         request: ReadResourceRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        self.read_resource_impl(&request.uri).await.map(Into::into)
+        self.read_resource_impl(&request.uri, &context.extensions)
+            .await
+            .map(Into::into)
     }
 
     // Curated investigation prompts (ROADMAP "MCP prompts catalog"). The catalog
@@ -1269,6 +1469,12 @@ pub mod audit;
 pub mod http;
 #[cfg(feature = "http")]
 pub mod oidc;
+/// NetBox API-token pass-through (Pattern 4): the caller's own NetBox token
+/// rides on every `/mcp` request and is forwarded verbatim to NetBox, so one
+/// `nbox serve --http` instance serves many users under their own NetBox
+/// identity. HTTP-only — it is a property of the transport's headers.
+#[cfg(feature = "http")]
+pub mod passthrough;
 pub mod prompts;
 /// Per-user credential vault (Pattern 2, DESIGN §24). Maps OIDC `sub` →
 /// per-user NetBox token so write tools hit NetBox under the caller's

@@ -5,7 +5,7 @@
 
 use rmcp::ErrorData;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ErrorCode, ResourceContents};
+use rmcp::model::{ErrorCode, Extensions, ResourceContents};
 use serde_json::json;
 use wiremock::matchers::{header, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -139,7 +139,7 @@ async fn nbox_get_consults_cache_and_clear_busts_it() {
         .put(&key, &json!({ "name": "iad1", "from_cache": true }));
 
     let Json(v) = server
-        .get_cached(args.clone())
+        .get_cached(&server.base_scope(), args.clone())
         .await
         .expect("served from cache without touching the network");
     assert_eq!(v["from_cache"], json!(true));
@@ -148,7 +148,7 @@ async fn nbox_get_consults_cache_and_clear_busts_it() {
     // origin and errors — proving the clear tool busts the cache.
     server.cache.clear_all();
     assert!(
-        server.get_cached(args).await.is_err(),
+        server.get_cached(&server.base_scope(), args).await.is_err(),
         "after clear, a miss hits NetBox (unreachable in this test)"
     );
 }
@@ -180,7 +180,7 @@ async fn read_resource_consults_nbox_get_cache() {
         .put(&key, &json!({ "name": "IAD1", "from_cache": true }));
 
     let result = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("served from cache without touching the network");
     let value = one_text(&result, "nbox://site/iad1");
@@ -207,11 +207,14 @@ async fn nbox_get_and_resource_share_cache_entry() {
 
     let server = cached_server_for(&mock);
     let Json(via_get) = server
-        .nbox_get(Parameters(get_args(GetKind::Site, "iad1")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Site, "iad1")),
+            Extensions::new(),
+        )
         .await
         .expect("site via nbox_get");
     let result = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("site via resource");
     let via_resource = one_text(&result, "nbox://site/iad1");
@@ -246,7 +249,7 @@ async fn nbox_get_cache_hit_makes_zero_origin_requests() {
     let server = cached_server_for(&mock);
     let args = get_args(GetKind::Site, "iad1");
     let Json(first) = server
-        .nbox_get(Parameters(args.clone()))
+        .nbox_get(Parameters(args.clone()), Extensions::new())
         .await
         .expect("first nbox_get fills the cache");
     assert_eq!(first["name"], json!("IAD1"));
@@ -254,7 +257,7 @@ async fn nbox_get_cache_hit_makes_zero_origin_requests() {
     // Second read — same object, same args — must be a cache HIT: zero origin
     // requests. `.expect(1)` on the mock would fail if this touched the wire.
     let Json(second) = server
-        .nbox_get(Parameters(args))
+        .nbox_get(Parameters(args), Extensions::new())
         .await
         .expect("second nbox_get served from cache");
     assert_eq!(second["name"], json!("IAD1"));
@@ -281,15 +284,18 @@ async fn cache_clear_busts_resource_cache_entries() {
 
     let server = cached_server_for(&mock);
     let first = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("first resource read fills cache");
     assert_eq!(one_text(&first, "nbox://site/iad1")["name"], json!("IAD1"));
 
-    server.nbox_cache_clear().await.expect("cache clear");
+    server
+        .nbox_cache_clear(Extensions::new())
+        .await
+        .expect("cache clear");
 
     let second = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("second resource read refetches after clear");
     assert_eq!(one_text(&second, "nbox://site/iad1")["name"], json!("IAD1"));
@@ -315,13 +321,13 @@ async fn resource_cache_refetches_after_ttl_expiry() {
 
     let server = zero_ttl_cached_server_for(&mock);
     let first = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("first resource read fills cache");
     assert_eq!(one_text(&first, "nbox://site/iad1")["name"], json!("IAD1"));
 
     let second = server
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("second resource read refetches after immediate expiry");
     assert_eq!(one_text(&second, "nbox://site/iad1")["name"], json!("IAD1"));
@@ -366,14 +372,17 @@ async fn get_device_returns_device_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Device,
-            reference: "edge01".to_string(),
-            vrf: None,
-            site: None,
-            group: None,
-            fields: None,
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Device,
+                reference: "edge01".to_string(),
+                vrf: None,
+                site: None,
+                group: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("device lookup");
 
@@ -411,14 +420,17 @@ async fn get_with_fields_projects_to_requested_keys() {
     }
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Device,
-            reference: "edge01".to_string(),
-            vrf: None,
-            site: None,
-            group: None,
-            fields: Some(vec!["name".to_string(), "nope".to_string()]),
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Device,
+                reference: "edge01".to_string(),
+                vrf: None,
+                site: None,
+                group: None,
+                fields: Some(vec!["name".to_string(), "nope".to_string()]),
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("device lookup");
 
@@ -438,14 +450,17 @@ async fn get_missing_device_is_invalid_params() {
 
     // `Json` doesn't impl Debug, so match rather than `expect_err`.
     let err: ErrorData = match server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Device,
-            reference: "nope".to_string(),
-            vrf: None,
-            site: None,
-            group: None,
-            fields: None,
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Device,
+                reference: "nope".to_string(),
+                vrf: None,
+                site: None,
+                group: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
     {
         Ok(_) => panic!("missing device should error"),
@@ -499,22 +514,25 @@ async fn search_returns_results_and_errors() {
     }
 
     let Json(report) = server_for(&mock)
-        .nbox_search(Parameters(SearchArgs {
-            query: "edge".to_string(),
-            limit: None,
-            status: None,
-            site: None,
-            region: None,
-            site_group: None,
-            location: None,
-            tenant: None,
-            role: None,
-            tag: None,
-            owner: None,
-            owner_group: None,
-            vrf: None,
-            fields: None,
-        }))
+        .nbox_search(
+            Parameters(SearchArgs {
+                query: "edge".to_string(),
+                limit: None,
+                status: None,
+                site: None,
+                region: None,
+                site_group: None,
+                location: None,
+                tenant: None,
+                role: None,
+                tag: None,
+                owner: None,
+                owner_group: None,
+                vrf: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("search");
 
@@ -555,7 +573,10 @@ async fn status_returns_versions() {
         .mount(&mock)
         .await;
 
-    let Json(report) = server_for(&mock).nbox_status().await.expect("status");
+    let Json(report) = server_for(&mock)
+        .nbox_status(Extensions::new())
+        .await
+        .expect("status");
     let value = serde_json::to_value(&report).expect("serialize report");
 
     assert_eq!(value["netbox_version"], "4.5.5");
@@ -615,22 +636,25 @@ async fn search_reports_partial_endpoint_errors() {
     }
 
     let Json(report) = server_for(&mock)
-        .nbox_search(Parameters(SearchArgs {
-            query: "edge".to_string(),
-            limit: None,
-            status: None,
-            site: None,
-            region: None,
-            site_group: None,
-            location: None,
-            tenant: None,
-            role: None,
-            tag: None,
-            owner: None,
-            owner_group: None,
-            vrf: None,
-            fields: None,
-        }))
+        .nbox_search(
+            Parameters(SearchArgs {
+                query: "edge".to_string(),
+                limit: None,
+                status: None,
+                site: None,
+                region: None,
+                site_group: None,
+                location: None,
+                tenant: None,
+                role: None,
+                tag: None,
+                owner: None,
+                owner_group: None,
+                vrf: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("search");
 
@@ -681,7 +705,10 @@ async fn get_ip_returns_ip_view_with_parent_context() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Ip, "10.44.208.55")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Ip, "10.44.208.55")),
+            Extensions::new(),
+        )
         .await
         .expect("ip lookup");
 
@@ -750,7 +777,10 @@ async fn get_prefix_returns_children_and_ips() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")),
+            Extensions::new(),
+        )
         .await
         .expect("prefix lookup");
 
@@ -803,7 +833,10 @@ async fn get_vlan_by_vid_returns_vlan_view_with_prefixes() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Vlan, "208")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Vlan, "208")),
+            Extensions::new(),
+        )
         .await
         .expect("vlan lookup");
 
@@ -841,7 +874,10 @@ async fn get_vlan_ambiguous_vid_is_invalid_params_with_candidates() {
         .await;
 
     let err: ErrorData = match server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Vlan, "208")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Vlan, "208")),
+            Extensions::new(),
+        )
         .await
     {
         Ok(_) => panic!("ambiguous VLAN should error"),
@@ -885,14 +921,17 @@ async fn get_vlan_disambiguated_by_site_resolves() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Vlan,
-            reference: "208".to_string(),
-            vrf: None,
-            site: Some("sfo1".to_string()),
-            group: None,
-            fields: None,
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Vlan,
+                reference: "208".to_string(),
+                vrf: None,
+                site: Some("sfo1".to_string()),
+                group: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("vlan disambiguated by site");
 
@@ -934,14 +973,17 @@ async fn get_vlan_site_disambiguation_prefers_exact_slug_over_prefix_sibling() {
 
     // `--site ci-site` → exact slug match on ci-site wins, ci-site2 excluded.
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Vlan,
-            reference: "1234".to_string(),
-            vrf: None,
-            site: Some("ci-site".to_string()),
-            group: None,
-            fields: None,
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Vlan,
+                reference: "1234".to_string(),
+                vrf: None,
+                site: Some("ci-site".to_string()),
+                group: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("ci-site disambiguates to ci-vlan");
     assert_eq!(value["vid"], 1234);
@@ -950,14 +992,17 @@ async fn get_vlan_site_disambiguation_prefers_exact_slug_over_prefix_sibling() {
 
     // `--site ci-site2` resolves to the other VLAN.
     let Json(value2) = server_for(&mock)
-        .nbox_get(Parameters(GetArgs {
-            kind: GetKind::Vlan,
-            reference: "1234".to_string(),
-            vrf: None,
-            site: Some("ci-site2".to_string()),
-            group: None,
-            fields: None,
-        }))
+        .nbox_get(
+            Parameters(GetArgs {
+                kind: GetKind::Vlan,
+                reference: "1234".to_string(),
+                vrf: None,
+                site: Some("ci-site2".to_string()),
+                group: None,
+                fields: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("ci-site2 disambiguates to ci-vlan2");
     assert_eq!(value2["vid"], 1234);
@@ -984,7 +1029,10 @@ async fn get_site_returns_site_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Site, "iad1")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Site, "iad1")),
+            Extensions::new(),
+        )
         .await
         .expect("site lookup");
 
@@ -1036,7 +1084,10 @@ async fn get_circuit_returns_circuit_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Circuit, "ACME-1234")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Circuit, "ACME-1234")),
+            Extensions::new(),
+        )
         .await
         .expect("circuit lookup");
 
@@ -1077,7 +1128,10 @@ async fn get_tenant_returns_tenant_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Tenant, "acme")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Tenant, "acme")),
+            Extensions::new(),
+        )
         .await
         .expect("tenant lookup");
 
@@ -1118,7 +1172,10 @@ async fn get_contact_returns_contact_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Contact, "Jane Doe")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Contact, "Jane Doe")),
+            Extensions::new(),
+        )
         .await
         .expect("contact lookup");
 
@@ -1162,7 +1219,10 @@ async fn get_provider_returns_provider_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Provider, "acme-telecom")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Provider, "acme-telecom")),
+            Extensions::new(),
+        )
         .await
         .expect("provider lookup");
 
@@ -1201,7 +1261,10 @@ async fn get_vm_returns_vm_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Vm, "web-01")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Vm, "web-01")),
+            Extensions::new(),
+        )
         .await
         .expect("vm lookup");
 
@@ -1242,7 +1305,10 @@ async fn get_cluster_returns_cluster_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Cluster, "prod")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Cluster, "prod")),
+            Extensions::new(),
+        )
         .await
         .expect("cluster lookup");
 
@@ -1273,7 +1339,10 @@ async fn get_asn_returns_asn_view() {
         .await;
 
     let Json(value) = server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Asn, "64512")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Asn, "64512")),
+            Extensions::new(),
+        )
         .await
         .expect("asn lookup");
 
@@ -1292,7 +1361,10 @@ async fn get_missing_prefix_is_invalid_params() {
         .await;
 
     let err: ErrorData = match server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Prefix, "10.99.99.0/24")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Prefix, "10.99.99.0/24")),
+            Extensions::new(),
+        )
         .await
     {
         Ok(_) => panic!("missing prefix should error"),
@@ -1357,10 +1429,13 @@ async fn get_interface_includes_cable_path_trace() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_get_interface(Parameters(InterfaceArgs {
-            device: "edge01".to_string(),
-            interface: "xe-0/0/0".to_string(),
-        }))
+        .nbox_get_interface(
+            Parameters(InterfaceArgs {
+                device: "edge01".to_string(),
+                interface: "xe-0/0/0".to_string(),
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("interface lookup");
 
@@ -1399,11 +1474,14 @@ async fn next_ip_returns_available_addresses() {
         .await;
 
     let Json(report) = server_for(&mock)
-        .nbox_next_ip(Parameters(NextIpArgs {
-            prefix: "10.44.208.0/24".to_string(),
-            count: Some(2),
-            vrf: None,
-        }))
+        .nbox_next_ip(
+            Parameters(NextIpArgs {
+                prefix: "10.44.208.0/24".to_string(),
+                count: Some(2),
+                vrf: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("next ip");
 
@@ -1438,11 +1516,14 @@ async fn next_prefix_with_length_returns_first_block() {
         .await;
 
     let Json(report) = server_for(&mock)
-        .nbox_next_prefix(Parameters(NextPrefixArgs {
-            prefix: "10.44.208.0/24".to_string(),
-            length: Some(26),
-            vrf: None,
-        }))
+        .nbox_next_prefix(
+            Parameters(NextPrefixArgs {
+                prefix: "10.44.208.0/24".to_string(),
+                length: Some(26),
+                vrf: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("next prefix");
 
@@ -1482,11 +1563,14 @@ async fn next_prefix_with_length_finds_fitting_block_beyond_first_50() {
         .await;
 
     let Json(report) = server_for(&mock)
-        .nbox_next_prefix(Parameters(NextPrefixArgs {
-            prefix: "10.44.0.0/16".to_string(),
-            length: Some(25),
-            vrf: None,
-        }))
+        .nbox_next_prefix(
+            Parameters(NextPrefixArgs {
+                prefix: "10.44.0.0/16".to_string(),
+                length: Some(25),
+                vrf: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("next prefix");
 
@@ -1519,11 +1603,14 @@ async fn next_prefix_without_length_lists_all_free_blocks() {
         .await;
 
     let Json(report) = server_for(&mock)
-        .nbox_next_prefix(Parameters(NextPrefixArgs {
-            prefix: "10.44.208.0/24".to_string(),
-            length: None,
-            vrf: None,
-        }))
+        .nbox_next_prefix(
+            Parameters(NextPrefixArgs {
+                prefix: "10.44.208.0/24".to_string(),
+                length: None,
+                vrf: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("next prefix");
 
@@ -1560,11 +1647,14 @@ async fn journal_returns_entries_for_device() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_journal(Parameters(JournalArgs {
-            kind: GetKind::Device,
-            reference: "edge01".to_string(),
-            limit: None,
-        }))
+        .nbox_journal(
+            Parameters(JournalArgs {
+                kind: GetKind::Device,
+                reference: "edge01".to_string(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("journal");
 
@@ -1601,11 +1691,14 @@ async fn journal_returns_entries_for_aggregate() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_journal(Parameters(JournalArgs {
-            kind: GetKind::Aggregate,
-            reference: "10.0.0.0/8".to_string(),
-            limit: None,
-        }))
+        .nbox_journal(
+            Parameters(JournalArgs {
+                kind: GetKind::Aggregate,
+                reference: "10.0.0.0/8".to_string(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("journal");
 
@@ -1640,11 +1733,14 @@ async fn journal_returns_entries_for_asn() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_journal(Parameters(JournalArgs {
-            kind: GetKind::Asn,
-            reference: "64512".to_string(),
-            limit: None,
-        }))
+        .nbox_journal(
+            Parameters(JournalArgs {
+                kind: GetKind::Asn,
+                reference: "64512".to_string(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("journal");
 
@@ -1679,11 +1775,14 @@ async fn journal_returns_entries_for_ip_range() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_journal(Parameters(JournalArgs {
-            kind: GetKind::IpRange,
-            reference: "10.0.0.1".to_string(),
-            limit: None,
-        }))
+        .nbox_journal(
+            Parameters(JournalArgs {
+                kind: GetKind::IpRange,
+                reference: "10.0.0.1".to_string(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("journal");
 
@@ -1748,12 +1847,15 @@ async fn history_returns_changes_for_device() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_history(Parameters(HistoryArgs {
-            kind: GetKind::Device,
-            reference: "edge01".to_string(),
-            limit: None,
-            diff: None,
-        }))
+        .nbox_history(
+            Parameters(HistoryArgs {
+                kind: GetKind::Device,
+                reference: "edge01".to_string(),
+                limit: None,
+                diff: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("history");
 
@@ -1789,7 +1891,7 @@ async fn list_tags_returns_tag_rows() {
         .await;
 
     let Json(view) = server_for(&mock)
-        .nbox_list_tags(Parameters(ListTagsArgs { limit: None }))
+        .nbox_list_tags(Parameters(ListTagsArgs { limit: None }), Extensions::new())
         .await
         .expect("list tags");
 
@@ -1840,10 +1942,13 @@ async fn tagged_returns_objects_carrying_a_tag() {
         .await;
 
     let Json(report) = server_for(&mock)
-        .nbox_tagged(Parameters(TaggedArgs {
-            tag: "prod:us-east".into(),
-            limit: None,
-        }))
+        .nbox_tagged(
+            Parameters(TaggedArgs {
+                tag: "prod:us-east".into(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
         .expect("tagged");
 
@@ -1872,10 +1977,13 @@ async fn tagged_returns_invalid_params_for_a_no_match_tag() {
         .await;
 
     let err: ErrorData = match server_for(&mock)
-        .nbox_tagged(Parameters(TaggedArgs {
-            tag: "nonexistent".into(),
-            limit: None,
-        }))
+        .nbox_tagged(
+            Parameters(TaggedArgs {
+                tag: "nonexistent".into(),
+                limit: None,
+            }),
+            Extensions::new(),
+        )
         .await
     {
         Ok(_) => panic!("no-match tag should error"),
@@ -1908,7 +2016,10 @@ async fn get_ambiguous_ip_is_invalid_params_with_candidates() {
         .await;
 
     let err: ErrorData = match server_for(&mock)
-        .nbox_get(Parameters(get_args(GetKind::Ip, "10.0.0.1")))
+        .nbox_get(
+            Parameters(get_args(GetKind::Ip, "10.0.0.1")),
+            Extensions::new(),
+        )
         .await
     {
         Ok(_) => panic!("ambiguous IP should error"),
@@ -2043,7 +2154,7 @@ async fn read_resource_returns_site_view() {
         .await;
 
     let result = server_for(&mock)
-        .read_resource_impl("nbox://site/iad1")
+        .read_resource_impl("nbox://site/iad1", &Extensions::new())
         .await
         .expect("read site resource");
     let value = one_text(&result, "nbox://site/iad1");
@@ -2076,7 +2187,7 @@ async fn read_resource_returns_virtual_circuit_view() {
         .await;
 
     let result = server_for(&mock)
-        .read_resource_impl("nbox://virtual_circuit/VC-100")
+        .read_resource_impl("nbox://virtual_circuit/VC-100", &Extensions::new())
         .await
         .expect("read virtual-circuit resource");
     let value = one_text(&result, "nbox://virtual_circuit/VC-100");
@@ -2126,7 +2237,7 @@ async fn read_resource_returns_prefix_view_for_encoded_cidr() {
         .await;
 
     let result = server_for(&mock)
-        .read_resource_impl("nbox://prefix/10.44.208.0%2F24")
+        .read_resource_impl("nbox://prefix/10.44.208.0%2F24", &Extensions::new())
         .await
         .expect("read prefix resource");
     let value = one_text(&result, "nbox://prefix/10.44.208.0%2F24");
@@ -2137,7 +2248,7 @@ async fn read_resource_returns_prefix_view_for_encoded_cidr() {
 async fn read_resource_unknown_kind_is_invalid_params() {
     let mock = MockServer::start().await;
     let err = server_for(&mock)
-        .read_resource_impl("nbox://gadget/edge01")
+        .read_resource_impl("nbox://gadget/edge01", &Extensions::new())
         .await
         .expect_err("unknown kind errors");
     assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -2155,7 +2266,7 @@ async fn read_resource_missing_object_is_invalid_params() {
         .await;
 
     let err = server_for(&mock)
-        .read_resource_impl("nbox://device/nope")
+        .read_resource_impl("nbox://device/nope", &Extensions::new())
         .await
         .expect_err("missing object errors");
     assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
@@ -2173,9 +2284,9 @@ async fn read_resource_missing_object_is_invalid_params() {
 // JSON-RPC wire snapshots.
 mod contracts {
     use super::{
-        ErrorCode, GetKind, HistoryArgs, JournalArgs, Json, ListTagsArgs, Mock, MockServer,
-        NextIpArgs, Parameters, ResponseTemplate, SearchArgs, TaggedArgs, empty_page, get_args,
-        method, mount_empty, mount_one, one_text, path, query_param, server_for,
+        ErrorCode, Extensions, GetKind, HistoryArgs, JournalArgs, Json, ListTagsArgs, Mock,
+        MockServer, NextIpArgs, Parameters, ResponseTemplate, SearchArgs, TaggedArgs, empty_page,
+        get_args, method, mount_empty, mount_one, one_text, path, query_param, server_for,
     };
     use rmcp::ErrorData;
     use serde_json::{Value, json};
@@ -2265,7 +2376,10 @@ mod contracts {
             .mount(&mock)
             .await;
 
-        let Json(report) = server_for(&mock).nbox_status().await.expect("status");
+        let Json(report) = server_for(&mock)
+            .nbox_status(Extensions::new())
+            .await
+            .expect("status");
         let value = serde_json::to_value(&report).expect("serialize report");
 
         // Top-level contract: every key always present (no skip_serializing).
@@ -2334,7 +2448,7 @@ mod contracts {
         mount_search_endpoints_empty(&mock).await;
 
         let Json(report) = server_for(&mock)
-            .nbox_search(Parameters(search_args("edge01")))
+            .nbox_search(Parameters(search_args("edge01")), Extensions::new())
             .await
             .expect("search");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -2379,7 +2493,7 @@ mod contracts {
         let mut args = search_args("edge01");
         args.fields = Some(vec!["kind".to_string(), "display".to_string()]);
         let Json(value) = server_for(&mock)
-            .nbox_search(Parameters(args))
+            .nbox_search(Parameters(args), Extensions::new())
             .await
             .expect("search");
 
@@ -2434,7 +2548,7 @@ mod contracts {
         }
 
         let Json(report) = server_for(&mock)
-            .nbox_search(Parameters(search_args("10.0.0.1")))
+            .nbox_search(Parameters(search_args("10.0.0.1")), Extensions::new())
             .await
             .expect("search");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -2482,7 +2596,7 @@ mod contracts {
         }
 
         let Json(report) = server_for(&mock)
-            .nbox_search(Parameters(search_args("edge")))
+            .nbox_search(Parameters(search_args("edge")), Extensions::new())
             .await
             .expect("search succeeds despite a per-endpoint failure");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -2535,7 +2649,10 @@ mod contracts {
             .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")),
+                Extensions::new(),
+            )
             .await
             .expect("prefix lookup");
 
@@ -2600,7 +2717,10 @@ mod contracts {
             .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Prefix, "10.44.0.0/22")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Prefix, "10.44.0.0/22")),
+                Extensions::new(),
+            )
             .await
             .expect("prefix lookup");
 
@@ -2653,14 +2773,17 @@ mod contracts {
         let get_mock = MockServer::start().await;
         mount_prefix(&get_mock).await;
         let Json(via_get) = server_for(&get_mock)
-            .nbox_get(Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Prefix, "10.44.208.0/24")),
+                Extensions::new(),
+            )
             .await
             .expect("prefix via nbox_get");
 
         let res_mock = MockServer::start().await;
         mount_prefix(&res_mock).await;
         let result = server_for(&res_mock)
-            .read_resource_impl("nbox://prefix/10.44.208.0%2F24")
+            .read_resource_impl("nbox://prefix/10.44.208.0%2F24", &Extensions::new())
             .await
             .expect("prefix via resource");
         let via_resource = one_text(&result, "nbox://prefix/10.44.208.0%2F24");
@@ -2680,7 +2803,10 @@ mod contracts {
         let nf = MockServer::start().await;
         mount_empty(&nf, "/api/dcim/devices/").await;
         let err: ErrorData = match server_for(&nf)
-            .nbox_get(Parameters(get_args(GetKind::Device, "nope")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Device, "nope")),
+                Extensions::new(),
+            )
             .await
         {
             Ok(_) => panic!("missing device should error"),
@@ -2706,7 +2832,10 @@ mod contracts {
             .mount(&amb)
             .await;
         let err: ErrorData = match server_for(&amb)
-            .nbox_get(Parameters(get_args(GetKind::Ip, "10.0.0.1")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Ip, "10.0.0.1")),
+                Extensions::new(),
+            )
             .await
         {
             Ok(_) => panic!("ambiguous IP should error"),
@@ -2724,7 +2853,10 @@ mod contracts {
             .mount(&boom)
             .await;
         let err: ErrorData = match server_for(&boom)
-            .nbox_get(Parameters(get_args(GetKind::Prefix, "10.0.0.0/24")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Prefix, "10.0.0.0/24")),
+                Extensions::new(),
+            )
             .await
         {
             Ok(_) => panic!("a 500 should error"),
@@ -2763,11 +2895,14 @@ mod contracts {
             .await;
 
         let Json(report) = server_for(&mock)
-            .nbox_next_ip(Parameters(NextIpArgs {
-                prefix: "10.0.0.0/24".to_string(),
-                count: Some(1),
-                vrf: None,
-            }))
+            .nbox_next_ip(
+                Parameters(NextIpArgs {
+                    prefix: "10.0.0.0/24".to_string(),
+                    count: Some(1),
+                    vrf: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("next ip");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -2783,7 +2918,7 @@ mod contracts {
     async fn cache_clear_report_shape_is_pinned() {
         let mock = MockServer::start().await;
         let Json(report) = server_for(&mock)
-            .nbox_cache_clear()
+            .nbox_cache_clear(Extensions::new())
             .await
             .expect("cache clear");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -2821,11 +2956,14 @@ mod contracts {
             .await;
 
         let Json(view) = server_for(&mock)
-            .nbox_journal(Parameters(JournalArgs {
-                kind: GetKind::Device,
-                reference: "edge01".to_string(),
-                limit: None,
-            }))
+            .nbox_journal(
+                Parameters(JournalArgs {
+                    kind: GetKind::Device,
+                    reference: "edge01".to_string(),
+                    limit: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("journal");
         let value = serde_json::to_value(&view).expect("serialize view");
@@ -2872,12 +3010,15 @@ mod contracts {
             .await;
 
         let Json(view) = server_for(&mock)
-            .nbox_history(Parameters(HistoryArgs {
-                kind: GetKind::Device,
-                reference: "edge01".to_string(),
-                limit: None,
-                diff: None,
-            }))
+            .nbox_history(
+                Parameters(HistoryArgs {
+                    kind: GetKind::Device,
+                    reference: "edge01".to_string(),
+                    limit: None,
+                    diff: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("history");
         let value = serde_json::to_value(&view).expect("serialize view");
@@ -2938,12 +3079,15 @@ mod contracts {
 
         // diff=false (default): compact row, no before/after keys.
         let Json(compact) = server_for(&mock)
-            .nbox_history(Parameters(HistoryArgs {
-                kind: GetKind::Device,
-                reference: "edge01".to_string(),
-                limit: Some(1),
-                diff: Some(false),
-            }))
+            .nbox_history(
+                Parameters(HistoryArgs {
+                    kind: GetKind::Device,
+                    reference: "edge01".to_string(),
+                    limit: Some(1),
+                    diff: Some(false),
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("compact history");
         let compact_val = serde_json::to_value(&compact).expect("serialize");
@@ -2952,12 +3096,15 @@ mod contracts {
 
         // diff=true: the full pre/post payloads surface as before/after.
         let Json(full) = server_for(&mock)
-            .nbox_history(Parameters(HistoryArgs {
-                kind: GetKind::Device,
-                reference: "edge01".to_string(),
-                limit: Some(1),
-                diff: Some(true),
-            }))
+            .nbox_history(
+                Parameters(HistoryArgs {
+                    kind: GetKind::Device,
+                    reference: "edge01".to_string(),
+                    limit: Some(1),
+                    diff: Some(true),
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("diff history");
         let full_val = serde_json::to_value(&full).expect("serialize");
@@ -2989,7 +3136,7 @@ mod contracts {
             .await;
 
         let Json(view) = server_for(&mock)
-            .nbox_list_tags(Parameters(ListTagsArgs { limit: None }))
+            .nbox_list_tags(Parameters(ListTagsArgs { limit: None }), Extensions::new())
             .await
             .expect("list tags");
         let value = serde_json::to_value(&view).expect("serialize view");
@@ -3039,10 +3186,13 @@ mod contracts {
             .await;
 
         let Json(report) = server_for(&mock)
-            .nbox_tagged(Parameters(TaggedArgs {
-                tag: "prod:us-east".to_string(),
-                limit: None,
-            }))
+            .nbox_tagged(
+                Parameters(TaggedArgs {
+                    tag: "prod:us-east".to_string(),
+                    limit: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("tagged");
         let value = serde_json::to_value(&report).expect("serialize report");
@@ -3102,7 +3252,10 @@ mod contracts {
             .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Interface, "edge01/xe-0/0/0")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Interface, "edge01/xe-0/0/0")),
+                Extensions::new(),
+            )
             .await
             .expect("interface lookup");
 
@@ -3167,11 +3320,14 @@ mod contracts {
             .await;
 
         let Json(view) = server_for(&mock)
-            .nbox_journal(Parameters(JournalArgs {
-                kind: GetKind::Interface,
-                reference: "edge01/xe-0/0/0".to_string(),
-                limit: None,
-            }))
+            .nbox_journal(
+                Parameters(JournalArgs {
+                    kind: GetKind::Interface,
+                    reference: "edge01/xe-0/0/0".to_string(),
+                    limit: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("interface journal");
         let value = serde_json::to_value(&view).expect("serialize view");
@@ -3215,11 +3371,14 @@ mod contracts {
             .await;
 
         let Json(view) = server_for(&mock)
-            .nbox_journal(Parameters(JournalArgs {
-                kind: GetKind::VirtualCircuit,
-                reference: "VC-100".to_string(),
-                limit: None,
-            }))
+            .nbox_journal(
+                Parameters(JournalArgs {
+                    kind: GetKind::VirtualCircuit,
+                    reference: "VC-100".to_string(),
+                    limit: None,
+                }),
+                Extensions::new(),
+            )
             .await
             .expect("virtual-circuit journal");
         let value = serde_json::to_value(&view).expect("serialize view");
@@ -3264,7 +3423,10 @@ mod contracts {
         }
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Device, "edge01")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Device, "edge01")),
+                Extensions::new(),
+            )
             .await
             .expect("device lookup");
         assert_keys(&value, &["id", "name", "status", "owner"]);
@@ -3297,7 +3459,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Ip, "10.0.0.1")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Ip, "10.0.0.1")),
+                Extensions::new(),
+            )
             .await
             .expect("ip lookup");
         assert_keys(&value, &["address", "status", "parent_prefix"]);
@@ -3324,7 +3489,10 @@ mod contracts {
         mount_empty(&mock, "/api/ipam/prefixes/").await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Vlan, "208")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Vlan, "208")),
+                Extensions::new(),
+            )
             .await
             .expect("vlan lookup");
         assert_keys(&value, &["vid", "name", "status", "prefixes"]);
@@ -3348,7 +3516,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Site, "iad1")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Site, "iad1")),
+                Extensions::new(),
+            )
             .await
             .expect("site lookup");
         assert_keys(&value, &["id", "name", "slug", "status"]);
@@ -3372,7 +3543,7 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Rack, "R1")))
+            .nbox_get(Parameters(get_args(GetKind::Rack, "R1")), Extensions::new())
             .await
             .expect("rack lookup");
         assert_keys(&value, &["id", "name", "status"]);
@@ -3398,7 +3569,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::RackGroup, "row-a")))
+            .nbox_get(
+                Parameters(get_args(GetKind::RackGroup, "row-a")),
+                Extensions::new(),
+            )
             .await
             .expect("rack-group lookup");
         assert_keys(
@@ -3429,7 +3603,10 @@ mod contracts {
         mount_empty(&mock, "/api/circuits/circuit-terminations/").await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Circuit, "C-100")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Circuit, "C-100")),
+                Extensions::new(),
+            )
             .await
             .expect("circuit lookup");
         assert_keys(&value, &["cid", "status"]);
@@ -3480,7 +3657,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::VirtualCircuit, "VC-100")))
+            .nbox_get(
+                Parameters(get_args(GetKind::VirtualCircuit, "VC-100")),
+                Extensions::new(),
+            )
             .await
             .expect("virtual-circuit lookup");
         assert_keys(
@@ -3526,7 +3706,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Aggregate, "10.0.0.0/8")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Aggregate, "10.0.0.0/8")),
+                Extensions::new(),
+            )
             .await
             .expect("aggregate lookup");
         assert_keys(&value, &["prefix"]);
@@ -3549,7 +3732,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Asn, "65000")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Asn, "65000")),
+                Extensions::new(),
+            )
             .await
             .expect("asn lookup");
         assert_keys(&value, &["asn"]);
@@ -3573,7 +3759,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::IpRange, "10.0.0.10")))
+            .nbox_get(
+                Parameters(get_args(GetKind::IpRange, "10.0.0.10")),
+                Extensions::new(),
+            )
             .await
             .expect("ip-range lookup");
         assert_keys(&value, &["start_address", "end_address", "size"]);
@@ -3596,7 +3785,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Tenant, "eng")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Tenant, "eng")),
+                Extensions::new(),
+            )
             .await
             .expect("tenant lookup");
         assert_keys(&value, &["id", "name", "slug"]);
@@ -3619,7 +3811,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Contact, "Jane Q.")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Contact, "Jane Q.")),
+                Extensions::new(),
+            )
             .await
             .expect("contact lookup");
         assert_keys(&value, &["id", "name"]);
@@ -3641,7 +3836,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Provider, "acme")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Provider, "acme")),
+                Extensions::new(),
+            )
             .await
             .expect("provider lookup");
         assert_keys(&value, &["id", "name", "slug"]);
@@ -3665,7 +3863,7 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Vm, "vm01")))
+            .nbox_get(Parameters(get_args(GetKind::Vm, "vm01")), Extensions::new())
             .await
             .expect("vm lookup");
         assert_keys(&value, &["id", "name", "status"]);
@@ -3696,7 +3894,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::VmType, "web-tier")))
+            .nbox_get(
+                Parameters(get_args(GetKind::VmType, "web-tier")),
+                Extensions::new(),
+            )
             .await
             .expect("vm-type lookup");
         assert_keys(
@@ -3735,7 +3936,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Cluster, "prod-cluster")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Cluster, "prod-cluster")),
+                Extensions::new(),
+            )
             .await
             .expect("cluster lookup");
         assert_keys(&value, &["id", "name"]);
@@ -3763,7 +3967,10 @@ mod contracts {
         }
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Vrf, "65000:100")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Vrf, "65000:100")),
+                Extensions::new(),
+            )
             .await
             .expect("vrf lookup");
         assert_keys(
@@ -3800,7 +4007,10 @@ mod contracts {
         mount_empty(&mock, "/api/ipam/vrfs/").await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::RouteTarget, "65000:100")))
+            .nbox_get(
+                Parameters(get_args(GetKind::RouteTarget, "65000:100")),
+                Extensions::new(),
+            )
             .await
             .expect("route-target lookup");
         assert_keys(&value, &["summary", "importing_vrfs", "exporting_vrfs"]);
@@ -3829,7 +4039,10 @@ mod contracts {
         .await;
 
         let Json(value) = server_for(&mock)
-            .nbox_get(Parameters(get_args(GetKind::Mac, "aa:bb:cc:dd:ee:ff")))
+            .nbox_get(
+                Parameters(get_args(GetKind::Mac, "aa:bb:cc:dd:ee:ff")),
+                Extensions::new(),
+            )
             .await
             .expect("mac lookup");
         assert_keys(
@@ -4020,6 +4233,7 @@ async fn plan_write_rejects_when_vault_absent() {
                 },
             },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await;
     assert!(result.is_err(), "should reject writes when vault is absent");
@@ -4048,6 +4262,7 @@ async fn plan_write_rejects_when_no_caller_identity() {
                 },
             },
             None,
+            &Extensions::new(),
         )
         .await;
     let err = result.err().expect("no identity must be rejected");
@@ -4073,6 +4288,7 @@ async fn plan_write_rejects_stdio_without_local_writes() {
                 },
             },
             None,
+            &Extensions::new(),
         )
         .await;
     let err = result
@@ -4111,6 +4327,7 @@ async fn local_stdio_plan_apply_uses_profile_token() {
                 },
             },
             None,
+            &Extensions::new(),
         )
         .await
         .expect("local stdio plan should use profile token")
@@ -4118,7 +4335,11 @@ async fn local_stdio_plan_apply_uses_profile_token() {
     assert_eq!(plan.target.kind, "device");
 
     let receipt = server
-        .apply_write_impl(crate::mcp::write::ApplyWriteArgs { plan }, None)
+        .apply_write_impl(
+            crate::mcp::write::ApplyWriteArgs { plan },
+            None,
+            &Extensions::new(),
+        )
         .await
         .expect("local stdio apply should use the stored plan")
         .0;
@@ -4177,7 +4398,11 @@ async fn local_stdio_forged_plan_is_rejected() {
     assert!(forged.verify().is_ok(), "forged plan is self-consistent");
 
     let result = server
-        .apply_write_impl(crate::mcp::write::ApplyWriteArgs { plan: forged }, None)
+        .apply_write_impl(
+            crate::mcp::write::ApplyWriteArgs { plan: forged },
+            None,
+            &Extensions::new(),
+        )
         .await;
     let err = result.err().expect("forged local plan must be rejected");
     assert!(
@@ -4209,6 +4434,7 @@ async fn local_stdio_plan_is_one_shot() {
                 },
             },
             None,
+            &Extensions::new(),
         )
         .await
         .expect("local plan")
@@ -4218,11 +4444,16 @@ async fn local_stdio_plan_is_one_shot() {
         .apply_write_impl(
             crate::mcp::write::ApplyWriteArgs { plan: plan.clone() },
             None,
+            &Extensions::new(),
         )
         .await
         .expect("first apply succeeds");
     let replay = server
-        .apply_write_impl(crate::mcp::write::ApplyWriteArgs { plan }, None)
+        .apply_write_impl(
+            crate::mcp::write::ApplyWriteArgs { plan },
+            None,
+            &Extensions::new(),
+        )
         .await;
     let err = replay.err().expect("second apply must be rejected");
     assert!(
@@ -4248,6 +4479,7 @@ async fn local_writes_do_not_bypass_oidc_vault_path() {
                 },
             },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await;
     let err = result.err().expect("OIDC caller must require vault");
@@ -4280,6 +4512,7 @@ async fn plan_write_rejects_when_missing_write_scope() {
                 },
             },
             Some(caller("alice", false)),
+            &Extensions::new(),
         )
         .await;
     let err = result.err().expect("missing write scope must be rejected");
@@ -4305,6 +4538,7 @@ async fn plan_write_rejects_when_sub_not_in_vault() {
                 },
             },
             Some(caller("bob", true)),
+            &Extensions::new(),
         )
         .await;
     let err = result.err().expect("unknown sub must be rejected");
@@ -4385,6 +4619,7 @@ async fn plan_write_device_status_produces_plan() {
                 },
             },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await;
 
@@ -4493,6 +4728,7 @@ async fn apply_write_rejects_forged_plan_never_issued() {
         .apply_write_impl(
             crate::mcp::write::ApplyWriteArgs { plan: forged },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await;
     unsafe {
@@ -4580,6 +4816,7 @@ async fn apply_write_device_status_applies_through_the_plan_store() {
                 },
             },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await
         .expect("plan should succeed")
@@ -4596,6 +4833,7 @@ async fn apply_write_device_status_applies_through_the_plan_store() {
         .apply_write_impl(
             crate::mcp::write::ApplyWriteArgs { plan: tampered },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await
         .expect("apply of a server-issued plan should succeed")
@@ -4680,6 +4918,7 @@ async fn apply_write_tag_on_prefix_routes_to_tag_applier() {
                 },
             },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await
         .expect("tag plan should succeed")
@@ -4693,6 +4932,7 @@ async fn apply_write_tag_on_prefix_routes_to_tag_applier() {
         .apply_write_impl(
             crate::mcp::write::ApplyWriteArgs { plan },
             Some(caller("alice", true)),
+            &Extensions::new(),
         )
         .await
         .expect("prefix tag apply must route to the tag applier, not error")
@@ -4703,4 +4943,339 @@ async fn apply_write_tag_on_prefix_routes_to_tag_applier() {
     assert!(receipt.applied);
     assert_eq!(receipt.target.kind, "prefix");
     assert_eq!(receipt.status, 200);
+}
+
+// ---------------------------------------------------------------------------
+// NetBox API-token pass-through (multi-user mode)
+// ---------------------------------------------------------------------------
+#[cfg(feature = "http")]
+mod passthrough {
+    use super::*;
+
+    /// The multi-user server: the profile supplies the URL only — there is no
+    /// service token, because in pass-through mode every tool call is authenticated
+    /// by the credential the *caller* presented.
+    fn passthrough_server_for(mock: &MockServer, allow_writes: bool) -> NboxMcp {
+        let profile = ProfileConfig {
+            url: mock.uri(),
+            ..Default::default()
+        };
+        NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::disabled(),
+            "prod".into(),
+            allow_writes,
+        )
+    }
+
+    /// Build the rmcp request extensions a Streamable-HTTP tool call carries,
+    /// optionally with the caller's NetBox token in them — exactly the handoff
+    /// `http::gate_inner` performs (it inserts the token into the axum request's
+    /// extensions; rmcp then stores the request `Parts` in the tool context).
+    fn request_extensions(netbox_token: Option<&str>) -> rmcp::model::Extensions {
+        request_extensions_with_identity(netbox_token, None)
+    }
+
+    /// [`request_extensions`], plus an OIDC identity the gate validated first
+    /// (pass-through layered on `--oidc-issuer`).
+    fn request_extensions_with_identity(
+        netbox_token: Option<&str>,
+        identity: Option<crate::mcp::oidc::Identity>,
+    ) -> rmcp::model::Extensions {
+        let mut request = axum::http::Request::builder().uri("/mcp").body(()).unwrap();
+        if let Some(id) = identity {
+            request.extensions_mut().insert(id);
+        }
+        if let Some(raw) = netbox_token {
+            let token =
+                crate::mcp::passthrough::PassthroughToken::new(raw).expect("a usable token");
+            request.extensions_mut().insert(token);
+        }
+        let (parts, ()) = request.into_parts();
+        let mut ext = rmcp::model::Extensions::new();
+        ext.insert(parts);
+        ext
+    }
+
+    #[tokio::test]
+    async fn passthrough_calls_netbox_with_the_callers_own_token() {
+        let mock = MockServer::start().await;
+        // The mock only answers when the request carries Alice's credential, so a
+        // server that fell back to the (absent) service token cannot pass this.
+        Mock::given(method("GET"))
+            .and(path("/api/dcim/sites/"))
+            .and(header("Authorization", "Token nbt_alice"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "count": 1, "next": null, "previous": null,
+                "results": [{
+                    "id": 1, "url": "http://nb/api/dcim/sites/1/",
+                    "name": "IAD1", "slug": "iad1"
+                }]
+            })))
+            .mount(&mock)
+            .await;
+        mount_empty(&mock, "/api/dcim/racks/").await;
+        mount_empty(&mock, "/api/dcim/devices/").await;
+        mount_empty(&mock, "/api/ipam/prefixes/").await;
+        mount_empty(&mock, "/api/ipam/vlans/").await;
+
+        let server = passthrough_server_for(&mock, false);
+        let Json(value) = server
+            .nbox_get(
+                Parameters(get_args(GetKind::Site, "iad1")),
+                request_extensions(Some("nbt_alice")),
+            )
+            .await
+            .expect("the site, fetched under the caller's own token");
+        assert_eq!(value["name"], json!("IAD1"));
+    }
+
+    #[tokio::test]
+    async fn passthrough_without_a_token_fails_closed() {
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, false);
+
+        let err = server
+            .scope_from_extensions(&request_extensions(None))
+            .err()
+            .expect("a pass-through server must never fall back to the service token");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("X-NetBox-Token"),
+            "the error should say where the token belongs: {}",
+            err.message
+        );
+        // And no request was made to NetBox at all.
+        assert!(mock.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn passthrough_partitions_the_read_cache_per_caller() {
+        // NetBox filters reads by permission, so one user's cached view must never be
+        // served to another. Point the client at a dead address: the only way a read
+        // can succeed here is a cache hit, which makes the isolation observable.
+        let profile = ProfileConfig {
+            url: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        let server = NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::from_settings(
+                "ignored".into(),
+                &crate::config::CacheSettings {
+                    enabled: true,
+                    ttl_secs: 30,
+                },
+            ),
+            "prod".into(),
+            false,
+        );
+
+        let alice = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .unwrap();
+        let bob = server
+            .scope_from_extensions(&request_extensions(Some("nbt_bob")))
+            .unwrap();
+
+        // Seed a value into Alice's partition only.
+        let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
+        alice
+            .cache
+            .put(&key, &json!({ "name": "iad1", "secret_to_alice": true }));
+
+        let args = get_args(GetKind::Site, "iad1");
+        let Json(value) = server
+            .get_cached(&alice, args.clone())
+            .await
+            .expect("Alice sees her own cached copy");
+        assert_eq!(value["secret_to_alice"], json!(true));
+
+        assert!(
+            server.get_cached(&bob, args).await.is_err(),
+            "Bob must miss Alice's partition and fall through to NetBox (unreachable here)"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_cache_clear_only_drops_the_callers_partition() {
+        let profile = ProfileConfig {
+            url: "http://127.0.0.1:9/".into(),
+            ..Default::default()
+        };
+        let server = NboxMcp::new_passthrough(
+            NetBoxClient::new(&profile, None).unwrap(),
+            crate::cache::Cache::from_settings(
+                "ignored".into(),
+                &crate::config::CacheSettings {
+                    enabled: true,
+                    ttl_secs: 30,
+                },
+            ),
+            "prod".into(),
+            false,
+        );
+        let alice = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .unwrap();
+        let bob = server
+            .scope_from_extensions(&request_extensions(Some("nbt_bob")))
+            .unwrap();
+
+        let key = crate::cache::CacheKey::object("site", "iad1", "vrf=;site=;group=");
+        alice.cache.put(&key, &json!({ "owner": "alice" }));
+        bob.cache.put(&key, &json!({ "owner": "bob" }));
+
+        // Bob clears "the cache" — Alice's entries must survive, or any caller could
+        // evict every other caller's reads at will.
+        server
+            .nbox_cache_clear(request_extensions(Some("nbt_bob")))
+            .await
+            .expect("cache clear");
+
+        let Json(value) = server
+            .get_cached(&alice, get_args(GetKind::Site, "iad1"))
+            .await
+            .expect("Alice's cached copy survived Bob's clear");
+        assert_eq!(value["owner"], json!("alice"));
+        assert!(
+            server
+                .get_cached(&bob, get_args(GetKind::Site, "iad1"))
+                .await
+                .is_err(),
+            "Bob's own partition was cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_writes_are_gated_on_allow_writes() {
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, false);
+        let args = crate::mcp::write::PlanWriteArgs {
+            operation: crate::mcp::write::WriteOperation::DeviceStatus {
+                device: "edge01".into(),
+                status: "active".into(),
+            },
+        };
+        let err = server
+            .plan_write_impl(args, None, &request_extensions(Some("nbt_alice")))
+            .await
+            .err()
+            .expect("writes are off by default, even with a valid caller token");
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(err.message.contains("allow-writes"), "{}", err.message);
+        assert!(
+            mock.received_requests().await.unwrap().is_empty(),
+            "a rejected write must not touch NetBox"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_non_passthrough_server_ignores_a_caller_token() {
+        // Defense in depth: a caller must not be able to switch a single-credential
+        // server into pass-through by sending the header anyway.
+        let mock = MockServer::start().await;
+        let server = server_for(&mock);
+        let scope = server
+            .scope_from_extensions(&request_extensions(Some("nbt_alice")))
+            .expect("the shared scope");
+        assert!(
+            scope.caller().is_none(),
+            "pass-through must be a server-side mode, never something a client can turn on"
+        );
+    }
+
+    fn device_status_plan_args() -> crate::mcp::write::PlanWriteArgs {
+        crate::mcp::write::PlanWriteArgs {
+            operation: crate::mcp::write::WriteOperation::DeviceStatus {
+                device: "edge01".into(),
+                status: "active".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn passthrough_plan_and_apply_run_under_the_callers_token() {
+        // Every mock requires Alice's token, so a write that fell back to any
+        // other credential would miss.
+        let mock = MockServer::start().await;
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let server = passthrough_server_for(&mock, true);
+        let alice = request_extensions(Some("nbt_alice.key"));
+
+        let Json(plan) = server
+            .plan_write_impl(device_status_plan_args(), None, &alice)
+            .await
+            .expect("plan under the caller's token");
+        let Json(receipt) = server
+            .apply_write_impl(crate::mcp::write::ApplyWriteArgs { plan }, None, &alice)
+            .await
+            .expect("apply under the caller's token");
+        assert!(receipt.applied);
+        assert_eq!(receipt.status, 200);
+    }
+
+    #[tokio::test]
+    async fn passthrough_plan_from_one_token_cannot_be_applied_with_another() {
+        let mock = MockServer::start().await;
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let server = passthrough_server_for(&mock, true);
+        let Json(plan) = server
+            .plan_write_impl(
+                device_status_plan_args(),
+                None,
+                &request_extensions(Some("nbt_alice.key")),
+            )
+            .await
+            .expect("Alice's plan");
+        let err = server
+            .apply_write_impl(
+                crate::mcp::write::ApplyWriteArgs { plan },
+                None,
+                &request_extensions(Some("nbt_bob.key")),
+            )
+            .await
+            .err()
+            .expect("Bob must not apply Alice's plan");
+        assert!(
+            err.message.contains("different write actor"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn passthrough_over_oidc_still_requires_the_write_scope() {
+        // `--oidc-issuer … --netbox-token-passthrough --allow-writes`: a JWT with
+        // only `nbox:read` must not plan writes, whatever NetBox token rides along.
+        let mock = MockServer::start().await;
+        let server = passthrough_server_for(&mock, true);
+        let identity = |scopes: &[&str]| crate::mcp::oidc::Identity {
+            sub: Some("alice".into()),
+            client_id: None,
+            scopes: scopes.iter().map(|s| (*s).to_string()).collect(),
+            jti: None,
+            iss: None,
+        };
+
+        let read_only =
+            request_extensions_with_identity(Some("nbt_alice.key"), Some(identity(&["nbox:read"])));
+        let err = server
+            .plan_write_impl(device_status_plan_args(), None, &read_only)
+            .await
+            .err()
+            .expect("a read-only JWT must not plan writes");
+        assert!(err.message.contains("nbox:write"), "{}", err.message);
+        assert!(mock.received_requests().await.unwrap().is_empty());
+
+        mount_device_status_update_requiring_token(&mock, "nbt_alice.key").await;
+        let writer = request_extensions_with_identity(
+            Some("nbt_alice.key"),
+            Some(identity(&["nbox:read", "nbox:write"])),
+        );
+        server
+            .plan_write_impl(device_status_plan_args(), None, &writer)
+            .await
+            .expect("a write-scoped JWT plans under the caller's token");
+    }
 }

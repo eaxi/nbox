@@ -133,16 +133,16 @@ impl NetBoxClient {
     ///
     /// The MCP write path (Pattern 2, DESIGN §24) resolves a caller's OIDC
     /// `sub` to a per-user NetBox token via
-    /// [`crate::mcp::vault::CredentialVault`], then bridges it here so the
-    /// write `PATCH`/`POST` hits NetBox under the caller's identity — not
-    /// the shared service token. The GraphQL capability probe is intentionally
-    /// **not** shared with the original client: a per-user client is
-    /// short-lived (one plan + one apply) and should re-probe its own
-    /// capabilities, not inherit the service account's.
+    /// [`crate::mcp::vault::CredentialVault`], and token pass-through builds
+    /// one per request, so NetBox sees the caller's identity — not the shared
+    /// service token. The scheme is [`AuthScheme::Auto`]: the profile's pinned
+    /// scheme describes the profile's token, not the caller's. The GraphQL
+    /// capability probe is shared with the original client — it describes the
+    /// server's schema, not the user — so callers don't re-probe per request.
     pub(crate) fn with_token(&self, token: String) -> Self {
         Self {
             token: Some(token),
-            graphql_capabilities: Arc::new(tokio::sync::OnceCell::new()),
+            auth_scheme: AuthScheme::Auto,
             ..self.clone()
         }
     }
@@ -835,6 +835,17 @@ mod tests {
             format!("{err:#}").contains("no PEM certificates"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn with_token_uses_auto_scheme_and_shares_the_graphql_probe() {
+        let c = client_with("legacysecret", Some(AuthScheme::Token));
+        let caller = c.with_token("nbt_key.secretpart".into());
+        assert_eq!(caller.masked_authorization().unwrap(), "Bearer ****");
+        assert!(Arc::ptr_eq(
+            &c.graphql_capabilities,
+            &caller.graphql_capabilities
+        ));
     }
 
     #[test]

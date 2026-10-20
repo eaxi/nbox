@@ -297,6 +297,97 @@ user's NetBox token. HTTP/static-bearer transports cannot use `local_writes` in
 this release. The `nbox_plan_write` / `nbox_apply_write` tools expose the same
 plan → confirm-token → apply lifecycle as the CLI.
 
+## NetBox API-token pass-through (multi-user)
+
+The modes above all share **one** NetBox credential: whoever nbox is configured
+with. `--netbox-token-passthrough` (or `[serve].netbox_token_passthrough = true`)
+turns that around — each caller presents **their own NetBox API token** on every
+request, and nbox forwards it verbatim to NetBox. One nbox process then serves
+many users, and NetBox — not nbox — decides what each of them may see and change.
+
+```bash
+nbox serve --http 0.0.0.0:8080 --netbox-token-passthrough \
+  --allowed-host nbox.example.com
+```
+
+```toml
+[serve]
+http = "0.0.0.0:8080"
+netbox_token_passthrough = true
+```
+
+This is the only mode where NetBox's own object permissions and changelog apply
+to the real user. It needs no IdP, no credential vault, and no `[serve.vault]`
+mapping: the token *is* the identity.
+
+### How a client sends its token
+
+nbox reads the caller's NetBox token from either header:
+
+| Header | When to use it |
+| --- | --- |
+| `X-NetBox-Token: <token>` | Always accepted. Required when `Authorization` is already taken. |
+| `Authorization: Bearer <token>` / `Authorization: Token <token>` | Accepted only when `Authorization` isn't already in use by OIDC or `--http-token`. The `Bearer ` / `Token ` prefix is stripped before forwarding. |
+
+So a host that can only set a bearer works out of the box, and a host that needs
+`Authorization` for a gateway can still pass the NetBox token beside it:
+
+```json
+{
+  "mcpServers": {
+    "nbox": {
+      "type": "http",
+      "url": "https://nbox.example.com/mcp",
+      "headers": { "X-NetBox-Token": "${NETBOX_TOKEN}" }
+    }
+  }
+}
+```
+
+A request with no caller token is rejected before any MCP handling: `401` when
+nothing else authenticated it, `403` (no challenge) when OIDC or `--http-token`
+already did.
+nbox **never** falls back to its own profile token for such a request — a
+misconfigured client gets an error, not somebody else's privileges.
+
+### What the caller's token controls
+
+- **Reads** run under the caller's token, so NetBox filters results by that
+  user's permissions.
+- **The read cache is partitioned per token**, so one user's cached view is never
+  served to another. This is a correctness requirement, not an optimization:
+  NetBox returns different results to different users for the same query.
+- **`nbox_cache_clear` only clears the caller's own partition**, so no user can
+  evict everyone else's cached reads.
+- **Writes** are still opt-in with `--allow-writes` (or `[serve].allow_writes =
+  true`). When enabled they run under the caller's token, which means NetBox's
+  object permissions gate them and its changelog attributes them to the real
+  user. Behind OIDC the JWT still needs `nbox:write`. The `nbox_plan_write` →
+  `nbox_apply_write` confirm-token lifecycle is unchanged.
+- **The audit log** records a short, non-reversible fingerprint of the token
+  (`netbox_token_fp`, a SHA-256 prefix) and `auth=netbox-token`. Tokens are never
+  logged, printed, or included in error messages.
+- The server's own profile token is unused for request handling in this mode, and
+  a configured `[serve.vault]` is ignored (nbox warns at startup) — the vault
+  exists to bridge OIDC identities to tokens, which pass-through makes redundant.
+
+### Deployment notes
+
+- **Pass-through requires the HTTP transport.** stdio has no per-request headers,
+  so `nbox serve --netbox-token-passthrough` without `--http` is a usage error
+  rather than a silent no-op.
+- **Terminate TLS in front of nbox.** Callers send real NetBox credentials on
+  every request; run it behind a reverse proxy with HTTPS, and set
+  `--allowed-host` to the public hostname so the `Host`/`Origin` checks match.
+- Because pass-through servers are meant to be shared, binding a routable
+  address is allowed in this mode without the loopback restriction the
+  single-credential modes apply.
+- **Rate limiting** (below) keys its per-caller bucket on the token fingerprint,
+  so one user cannot spend another user's budget (a client rotating tokens
+  gets a fresh bucket per token). The coarse pre-auth bucket is
+  still per peer IP — behind a reverse proxy every caller shares that peer, so
+  size `--rate-limit` for the whole fleet or have the proxy do per-user limiting.
+
 ## Operations (HTTP transport)
 
 Two operational features apply to the HTTP `/mcp` endpoint (not the
@@ -359,7 +450,8 @@ When enabled it applies on two levels, both at `N`/minute:
   limiter and could hammer JWT validation unthrottled). The check is per peer IP,
   so one peer flooding never throttles another.
 - **Post-auth, per caller.** An authenticated request additionally honors a
-  per-caller bucket keyed on the OIDC `sub` (else `client_id`). This catches a
+  per-caller bucket keyed on the OIDC `sub` (else `client_id`, else — in
+  pass-through mode — the caller's NetBox-token fingerprint). This catches a
   single identity spread across many source IPs.
 
 A loopback / static-bearer caller has no token identity, so its peer-IP bucket

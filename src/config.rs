@@ -138,6 +138,13 @@ pub struct ServeConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<u32>,
 
+    /// Serve many users from one HTTP instance: each caller presents their own
+    /// NetBox API token on every `/mcp` request and nbox forwards it verbatim,
+    /// instead of using the profile's service token. See
+    /// [`crate::mcp::passthrough`]. Overridden by `--netbox-token-passthrough`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub netbox_token_passthrough: bool,
+
     /// Whether to enable write tools on the MCP server (Pattern 2, DESIGN §24).
     /// When `false` (the default), all write tools reject with "writes
     /// disabled". When `true`, the operator must also provision
@@ -174,6 +181,7 @@ impl std::fmt::Debug for ServeConfig {
             .field("jwks_url", &self.jwks_url)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("rate_limit", &self.rate_limit)
+            .field("netbox_token_passthrough", &self.netbox_token_passthrough)
             .field("allow_writes", &self.allow_writes)
             .field("local_writes", &self.local_writes)
             .field("vault_entries", &self.vault.len())
@@ -1610,9 +1618,26 @@ search = "graphql"
         .unwrap();
         assert!(allow_only.serve.allow_writes);
         assert!(
+            !allow_only.serve.netbox_token_passthrough,
+            "multi-user pass-through must be opt-in, never implied by allow_writes"
+        );
+        assert!(
             !allow_only.serve.local_writes,
             "allow_writes must not imply local_writes"
         );
+
+        let passthrough: Config = toml::from_str(
+            "active_profile = \"work\"\n\
+             \n\
+             [serve]\n\
+             http = \"0.0.0.0:8080\"\n\
+             netbox_token_passthrough = true\n\
+             \n\
+             [profiles.work]\n\
+             url = \"https://netbox.example.com\"\n",
+        )
+        .unwrap();
+        assert!(passthrough.serve.netbox_token_passthrough);
 
         // The OIDC resource-server fields parse onto the same section.
         let oidc: Config = toml::from_str(

@@ -58,7 +58,17 @@ pub(crate) enum ApplierKind {
 /// principal. The key is internal to the plan store, not exposed as a credential.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum WriteActor {
-    Oidc { sub: String },
+    Oidc {
+        sub: String,
+    },
+    /// A NetBox API-token pass-through caller, identified by their token's full
+    /// SHA-256 digest. The credential itself *is* the identity here — NetBox
+    /// authenticates and authorizes it, and records the matching user in its own
+    /// change log — so a plan issued to one token can only ever be applied by a
+    /// request carrying that same token.
+    NetBoxToken {
+        digest: String,
+    },
     Local,
 }
 
@@ -66,6 +76,7 @@ impl WriteActor {
     pub(crate) fn key(&self) -> String {
         match self {
             WriteActor::Oidc { sub } => format!("sub:{sub}"),
+            WriteActor::NetBoxToken { digest } => format!("netbox-token:{digest}"),
             WriteActor::Local => "local".to_string(),
         }
     }
@@ -77,7 +88,16 @@ impl WriteActor {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum WriteMode {
     Http,
-    Stdio { local_writes: bool },
+    /// HTTP with NetBox API-token pass-through: the caller's own NetBox token
+    /// authorizes the write, so there is no vault and no OIDC scope to check —
+    /// `allow_writes` is the operator's single on/off gate, and NetBox's own
+    /// permissions decide what the caller may actually change.
+    Passthrough {
+        allow_writes: bool,
+    },
+    Stdio {
+        local_writes: bool,
+    },
 }
 
 impl WriteMode {
@@ -312,6 +332,16 @@ pub(crate) struct WriteCaller {
     pub has_write_scope: bool,
 }
 
+fn missing_write_scope() -> ErrorData {
+    ErrorData::invalid_params(
+        format!(
+            "the caller's token is missing the required `{}` scope for MCP writes",
+            crate::mcp::SCOPE_WRITE
+        ),
+        None,
+    )
+}
+
 impl NboxMcp {
     /// Resolve the NetBox client and write actor for an MCP write, enforcing the
     /// appropriate gate for the request shape:
@@ -326,8 +356,35 @@ impl NboxMcp {
     /// The profile token is used for writes only in explicit stdio local mode.
     fn write_client(
         &self,
+        scope: &super::RequestScope,
         caller: Option<WriteCaller>,
     ) -> Result<(NetBoxClient, WriteActor), ErrorData> {
+        // Pass-through first: when the request carried the caller's own NetBox
+        // token, that token is both the identity and the authorization, and the
+        // scope's client already holds it. No vault lookup — the write lands in
+        // NetBox as the caller, and NetBox refuses it if they lack the
+        // permission. When OIDC also authenticated the request, its `nbox:write`
+        // scope is still required.
+        if let Some(digest) = scope.caller() {
+            if scope.oidc_write_scope == Some(false) {
+                return Err(missing_write_scope());
+            }
+            return match self.write_mode {
+                WriteMode::Passthrough { allow_writes: true } => Ok((
+                    scope.client().clone(),
+                    WriteActor::NetBoxToken {
+                        digest: digest.to_string(),
+                    },
+                )),
+                _ => Err(ErrorData::invalid_params(
+                    "MCP writes are not enabled on this nbox serve instance; \
+                     set [serve].allow_writes = true or pass --allow-writes to let \
+                     NetBox API-token pass-through callers write under their own token",
+                    None,
+                )),
+            };
+        }
+
         if let Some(caller) = caller {
             let vault = self.vault.as_ref().ok_or_else(|| {
                 ErrorData::invalid_params(
@@ -338,13 +395,7 @@ impl NboxMcp {
                 )
             })?;
             if !caller.has_write_scope {
-                return Err(ErrorData::invalid_params(
-                    format!(
-                        "the caller's token is missing the required `{}` scope for MCP writes",
-                        crate::mcp::SCOPE_WRITE
-                    ),
-                    None,
-                ));
+                return Err(missing_write_scope());
             }
             let token = vault
                 .resolve(&caller.sub)
@@ -384,8 +435,10 @@ impl NboxMcp {
         &self,
         args: PlanWriteArgs,
         caller: Option<WriteCaller>,
+        ext: &rmcp::model::Extensions,
     ) -> Result<Json<MutationPlan>, ErrorData> {
-        let (client, actor) = self.write_client(caller)?;
+        let scope = &self.scope_from_extensions(ext)?;
+        let (client, actor) = self.write_client(scope, caller)?;
         let profile = self.profile.as_str();
         let (applier, plan_result) = match args.operation {
             WriteOperation::InterfaceDescription {
@@ -526,8 +579,10 @@ impl NboxMcp {
         &self,
         args: ApplyWriteArgs,
         caller: Option<WriteCaller>,
+        ext: &rmcp::model::Extensions,
     ) -> Result<Json<MutationReceipt>, ErrorData> {
-        let (client, actor) = self.write_client(caller)?;
+        let scope = &self.scope_from_extensions(ext)?;
+        let (client, actor) = self.write_client(scope, caller)?;
 
         // Apply the plan this server issued for the token — never the caller's
         // contents. A forged/tampered plan has no matching server-stored entry.

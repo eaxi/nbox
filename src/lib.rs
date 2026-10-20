@@ -598,6 +598,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             oidc_jwks_url,
             allowed_host,
             rate_limit,
+            netbox_token_passthrough,
             allow_writes,
             local_writes,
             print_config,
@@ -612,6 +613,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     oidc_jwks_url,
                     allowed_host,
                     rate_limit,
+                    netbox_token_passthrough,
                     allow_writes,
                     local_writes,
                     print_config,
@@ -748,6 +750,10 @@ struct ServeFlags {
     allowed_host: Vec<String>,
     /// Per-caller requests-per-minute cap; `None` ⇒ fall back to config / off.
     rate_limit: Option<u32>,
+    /// `--netbox-token-passthrough`: multi-user mode — each HTTP caller presents
+    /// their own NetBox API token, which nbox forwards to NetBox for that
+    /// request instead of using the profile's service token.
+    netbox_token_passthrough: bool,
     /// `--print-config`: print the `mcpServers` snippet and exit (no connect).
     /// `--allow-writes`: enable MCP write tools (Pattern 2). `false` (the
     /// default) keeps the server read-only.
@@ -794,6 +800,10 @@ async fn run_serve(ctx: &Ctx, flags: ServeFlags) -> Result<()> {
     // Per-caller rate limit: flag wins, then config, then off (0). Absent / 0 =
     // disabled, so existing behavior is unchanged unless the operator opts in.
     let rate_limit = flags.rate_limit.or(serve_cfg.rate_limit).unwrap_or(0);
+    // Multi-user NetBox API-token pass-through: flag OR config (either is an
+    // explicit opt-in).
+    let netbox_token_passthrough =
+        flags.netbox_token_passthrough || serve_cfg.netbox_token_passthrough;
     // Shared HTTP writes require both the flag/config gate and the HTTP
     // transport (OIDC identity → per-user token resolution via the vault).
     let allow_writes = flags.allow_writes || serve_cfg.allow_writes;
@@ -819,6 +829,19 @@ async fn run_serve(ctx: &Ctx, flags: ServeFlags) -> Result<()> {
         (None, _) => None,
     };
 
+    // Pass-through is a property of the HTTP transport's request headers: stdio
+    // has no per-request credential to read, so asking for it there is a usage
+    // error rather than a silent no-op that quietly keeps the service token.
+    if netbox_token_passthrough && http.is_none() {
+        return Err(error::NboxError::Usage(
+            "`--netbox-token-passthrough` / [serve].netbox_token_passthrough requires the \
+             HTTP transport — pass --http <ADDR>. The stdio transport has no per-request \
+             headers, so there is no caller token to forward."
+                .to_string(),
+        )
+        .into());
+    }
+
     if http.is_some() && local_writes {
         return Err(error::NboxError::Usage(
             "`--local-writes` / [serve].local_writes is only supported on the stdio MCP \
@@ -836,7 +859,15 @@ async fn run_serve(ctx: &Ctx, flags: ServeFlags) -> Result<()> {
     // Build the per-user credential vault for the shared HTTP/OIDC write path.
     // The vault maps OIDC `sub` → env var name holding a per-user NetBox token.
     // Local stdio writes intentionally do not use the vault.
-    let vault = if allow_writes && http.is_some() {
+    // Pass-through mode has no vault: the caller's own token is their
+    // credential, so there is nothing to map a `sub` onto.
+    if netbox_token_passthrough && !serve_cfg.vault.is_empty() {
+        tracing::warn!(
+            "[serve.vault] entries are ignored in NetBox API-token pass-through mode — \
+             each caller writes with the token they present"
+        );
+    }
+    let vault = if allow_writes && http.is_some() && !netbox_token_passthrough {
         Some(mcp::vault::CredentialVault::new(serve_cfg.vault, true))
     } else {
         None
@@ -856,6 +887,8 @@ async fn run_serve(ctx: &Ctx, flags: ServeFlags) -> Result<()> {
                 cache,
                 vault,
                 ctx.profile.clone().unwrap_or_default(),
+                netbox_token_passthrough,
+                allow_writes,
             )
             .await
         }
@@ -950,6 +983,8 @@ async fn serve_http_or_explain(
     cache: cache::Cache,
     vault: Option<mcp::vault::CredentialVault>,
     profile: String,
+    netbox_token_passthrough: bool,
+    allow_writes: bool,
 ) -> Result<()> {
     let oidc = oidc.map(|(issuer, audience)| mcp::OidcArgs {
         issuer,
@@ -967,6 +1002,8 @@ async fn serve_http_or_explain(
             cache,
             vault,
             profile,
+            netbox_token_passthrough,
+            allow_writes,
         },
     )
     .await
@@ -988,6 +1025,8 @@ async fn serve_http_or_explain(
     _cache: cache::Cache,
     _vault: Option<mcp::vault::CredentialVault>,
     _profile: String,
+    _netbox_token_passthrough: bool,
+    _allow_writes: bool,
 ) -> Result<()> {
     Err(error::NboxError::Usage(
         "`nbox serve --http` requires the `http` build feature, which this binary \

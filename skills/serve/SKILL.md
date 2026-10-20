@@ -29,6 +29,15 @@ For the flags, run `nbox serve --help` — this skill is flag-free by design.
   and an opt-in per-caller rate limit. This is **read-only Pattern 3**: the last
   hop to NetBox still uses the one local profile token, so the audit log is
   accountability, not per-user RBAC — trusted single-team read-only only.
+- **HTTP, multi-user** — `nbox serve --http 0.0.0.0:8080
+  --netbox-token-passthrough` (or `[serve].netbox_token_passthrough = true`)
+  makes one process serve many users: each caller sends their **own** NetBox API
+  token per request, in `X-NetBox-Token` or in `Authorization` when that header
+  isn't already used by OIDC / `--http-token`, and nbox forwards it to NetBox.
+  NetBox's permissions and changelog then apply to the real caller — no IdP, no
+  `[serve.vault]`. Reads are cached per token so nobody sees another user's view;
+  a request with no token is `401`, never downgraded to the server's token.
+  Requires `--http` (stdio has no per-request headers); terminate TLS in front.
 
 ## The read tools
 
@@ -75,6 +84,7 @@ config.
 nbox serve --print-config           # paste-ready mcpServers JSON, then exit
 nbox serve                          # stdio, read-only
 nbox serve --http 127.0.0.1:8080    # loopback HTTP, read-only
+nbox serve --http 0.0.0.0:8080 --netbox-token-passthrough   # multi-user: caller's own token
 ```
 
 ## Writes are a separate opt-in
@@ -84,8 +94,10 @@ The MCP server is read-only by default. The write tools (`nbox_plan_write` /
 one explicit write mode: local stdio `nbox serve --local-writes`, which uses the
 active profile token, or shared HTTP/OIDC `nbox serve --http --allow-writes` plus
 the caller's `nbox:write` scope and a `[serve.vault]` entry mapping their OIDC
-`sub` to a per-user NetBox token. HTTP/static-bearer profile-token writes reject
-in this release.
+`sub` to a per-user NetBox token. With `--netbox-token-passthrough`,
+`--allow-writes` is enough on its own — the write runs under the caller's own
+NetBox token, so NetBox authorizes and attributes it. HTTP/static-bearer
+profile-token writes reject in this release.
 `nbox_apply_write` applies the plan the server stored at plan time (looked up by
 the `confirm_token` from `nbox_plan_write`), not the plan you resubmit. For that
 lifecycle, see the [safe writes](../writes/SKILL.md) skill.
